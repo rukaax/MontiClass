@@ -1,84 +1,66 @@
 # Classroom-ESP32
 
-教室环境监测系统，基于 ESP32-S3 + oled-ui-astra UI 框架。
+ESP32-S3 教室环境监测器：SSD1306 OLED 实时显示光照、MQ135 和 DHT11 数据，使用 EC11 调整四项告警阈值。
 
-## 功能
+## 接线
 
-- SSD1306 OLED 屏幕（128x64, I2C）显示菜单和传感器数据
-- 旋转编码器控制菜单导航（左转/右转切换，按下确认）
-- 传感器数据实时采集与显示（光敏、MQ135、DHT11）
-- 串口输出传感器数据（115200 波特率，每 2 秒）
+| 模块 | 模块引脚 | ESP32-S3 GPIO |
+| --- | --- | --- |
+| SSD1306 OLED | SDA | 17 |
+| SSD1306 OLED | SCL | 18 |
+| EC11 | CLK | 4 |
+| EC11 | DT | 5 |
+| EC11 | SW | 8 |
+| 光敏模块 | AO | 7 |
+| MQ135 模块 | AO | 15 |
+| DHT11 | DATA | 16 |
 
-## 硬件
+所有模块必须共地。EC11 按键按下为高电平，程序使用 GPIO 8 的内部下拉。
 
-| 组件 | 型号/规格 |
-|------|----------|
-| 主控 | ESP32-S3 N16R8（16MB Flash, 8MB PSRAM） |
-| 显示 | SSD1306 OLED 128x64（I2C） |
-| 输入 | 旋转编码器（CLK/DT/SW 三线制） |
-| 光照 | 光敏电阻（ADC） |
-| 空气 | MQ135 气体传感器（ADC） |
-| 温湿度 | DHT11 数字传感器 |
+> 注意：ESP32-S3 GPIO 只能接受 **0–3.3V**。常见 MQ135 模块若由 5V 供电，AO 可能超过 3.3V；请使用分压器，或确认模块 AO 在该接法下不会超压。
 
-## 引脚分配
+## 使用方式
 
-| 功能 | GPIO |
-|------|------|
-| OLED SDA | 17 |
-| OLED SCL | 18 |
-| 编码器 CLK | 6 |
-| 编码器 DT | 4 |
-| 编码器 SW | 5 |
-| 光敏电阻 | 7 |
-| MQ135 | 15 |
-| DHT11 | 16 |
+- 上电后，OLED 的四行依次显示光照、空气、温度和湿度。
+- MQ135 前 30 秒显示“预热 + 原始 ADC 值”；预热后显示线性 ppm **估算值**。MQ135 需要用标准气体与环境基线校准后才能作为实际浓度使用。
+- 串口波特率为 `115200`，每两秒输出一次各模块读数，DHT11 失败时会给出接线检查提示。
+- EC11 也会输出调试信息：空闲时每秒一行，旋转/按键时立即输出一行。
+- 在主界面长按 EC11（≥800 ms）进入设置；旋转选择项目，短按进入调节；再次短按确认，长按返回主界面。
+- 阈值仅在本次运行期间保存；超阈值数据在 OLED 行末显示实心圆提示。
 
-引脚定义位于两处（保持一致）：
-- `lib/oled-ui-astra/hal/hal_esp32.h`
-- `include/sensors.h`
+阈值调节步长：光照/湿度为 1%，空气为 10 ppm，温度为 0.5°C。
 
-## 菜单结构
+## EC11 串口调试
 
-```
-Classroom（根菜单）
-  └── Sensors（传感器菜单）
-        ├── Light（光照强度）
-        ├── MQ135（空气质量）
-        └── DHT11（温度/湿度）
+使用 `pio device monitor -b 115200` 查看如下日志：
+
+```text
+[EC11] c=1 d=1 sw=0 st=3 q=0 pos=12 v=48 i=0 f=3 btn=0/0
 ```
 
-## 构建
+- `pos`：已识别的完整卡点累计数；每转一格只能变化 `+1` 或 `-1`。
+- `v`：有效的四相跳变数，正常每格约增加 4；`i` 是不可能的对角跳变。
+- `f`：被 150µs 边沿滤波或 4ms 卡点保护丢弃的毛刺。缓慢转动时偶尔增长正常；不转也快速增长说明触点抖动或线路干扰明显。
+- `btn`：原始 SW 电平/消抖后的有效按键状态；按下为 `1`。日志末尾的 `short` / `long` 表示一次已识别的按键事件。
 
-需要 [PlatformIO](https://platformio.org/)。
+## 构建和烧录
 
 ```bash
-# 编译
 pio run
-
-# 上传
 pio run -t upload
-
-# 串口监视
-pio device monitor
+pio device monitor -b 115200
 ```
-
-## 依赖库
-
-- [U8g2](https://github.com/olikraus/u8g2) - OLED 驱动
-- [DHT sensor library](https://github.com/adafruit/DHT-sensor-library) - DHT11 温湿度
-- [Adafruit Unified Sensor](https://github.com/adafruit/Adafruit_Sensor) - DHT 库依赖
 
 ## 项目结构
 
-```
-├── src/
-│   ├── main.cpp          # 主程序（初始化、菜单构建、主循环）
-│   └── sensors.cpp       # 传感器管理器实现
-├── include/
-│   └── sensors.h         # 传感器头文件与引脚定义
-├── lib/
-│   └── oled-ui-astra/    # OLED UI 框架
-│       ├── astra/        # UI 核心（菜单、选择器、摄像机、开机动画）
-│       └── hal/          # 硬件抽象层（ESP32 HAL 实现）
-└── platformio.ini        # PlatformIO 项目配置
+```text
+include/
+  control.h      # EC11 输入接口与引脚
+  sensors.h      # 三类传感器采集接口与引脚
+  SSD1306.h      # OLED 绘制接口、阈值定义与引脚
+src/
+  control.cpp    # 编码器中断与按键消抖
+  sensors.cpp    # ADC 平均采样、DHT11 检测、串口诊断
+  SSD1306.cpp    # 监测与设置界面
+  main.cpp       # 应用状态机
 ```

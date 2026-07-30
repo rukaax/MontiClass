@@ -1,130 +1,118 @@
-/**
- * @file SSD1306.cpp
- * @brief OLED显示模块 - 主界面和设置界面的绘制与动画
- */
+/** @file SSD1306.cpp */
 #include "SSD1306.h"
 
-static u8g2_t oled;
+#include <math.h>
 
-// ==================== 动画 ====================
-static float animY[4] = {64, 64, 64, 64};      // 各行当前Y坐标
-static float targetY[4] = {26, 38, 50, 62};    // 目标Y坐标（避开标题栏）
+namespace {
+// U8g2 的全缓冲对象。128x64 单色屏需要约 1 KB RAM，ESP32-S3 足够使用。
+u8g2_t oled;
 
-// 缓动动画：current向target靠近，speed越大越快
-static void animate(float* current, float target, float speed) {
-  *current += (target - *current) * speed;
-  if (fabs(*current - target) < 0.5f) *current = target;
+// NAN 与任何数比较都为 false；显式判断可确保传感器失效时不会误告警。
+bool exceeds(float value, float threshold) { return !isnan(value) && value > threshold; }
+
+void drawAlertMark(uint8_t y, bool alert) {
+  if (!alert) return;
+  // 固定画在右侧，不能覆盖最多约 100 像素宽的中文/数值文本。
+  u8g2_DrawDisc(&oled, 122, y - 5, 3, U8G2_DRAW_ALL);
 }
+}  // namespace
 
-// ==================== OLED初始化 ====================
 void oledInit() {
-  Wire.begin(OLED_SDA, OLED_SCL);
-  u8g2_Setup_ssd1306_i2c_128x64_noname_f(&oled, U8G2_R0,
-    u8x8_byte_arduino_hw_i2c, u8x8_gpio_and_delay_arduino);
-  u8g2_SetI2CAddress(&oled, OLED_ADDR << 1);
+  // 先由 Wire 绑定自定义 SDA/SCL，再交给 U8g2 使用硬件 I2C 后端。
+  Wire.begin(Pins::kOledSda, Pins::kOledScl);
+  u8g2_Setup_ssd1306_i2c_128x64_noname_f(
+      &oled, U8G2_R0, u8x8_byte_arduino_hw_i2c, u8x8_gpio_and_delay_arduino);
+  // U8g2 接收 8 位 I2C 地址，所以常见的 7 位 0x3C 必须左移一位。
+  u8g2_SetI2CAddress(&oled, kOledAddress << 1);
   u8g2_InitDisplay(&oled);
   u8g2_SetPowerSave(&oled, 0);
 }
 
-// ==================== 开机画面 ====================
 void drawBootScreen() {
+  // 所有画面均遵循 ClearBuffer -> Draw -> SendBuffer，避免残影。
   u8g2_ClearBuffer(&oled);
   u8g2_SetFont(&oled, u8g2_font_wqy12_t_gb2312);
-  u8g2_SetDrawColor(&oled, 1);
-  u8g2_DrawUTF8(&oled, 10, 25, "教室环境监测系统");
+  u8g2_DrawUTF8(&oled, 15, 24, "教室环境监测");
   u8g2_SetFont(&oled, u8g2_font_5x7_tf);
-  u8g2_DrawStr(&oled, 15, 45, "MQ135 warmup: 15s");
-  u8g2_DrawStr(&oled, 20, 55, "Starting...");
+  u8g2_DrawStr(&oled, 12, 43, "OLED + EC11 + Sensors");
+  u8g2_DrawStr(&oled, 12, 55, "MQ135 warming up...");
   u8g2_SendBuffer(&oled);
 }
 
-// ==================== 主界面 ====================
-void drawMonitor(SensorData d, int /*settingsIdx*/, bool /*editing*/, bool mq135Ready) {
-  char buf[32];
-
-  // 行入场动画
-  for (int i = 0; i < 4; i++) animate(&animY[i], targetY[i], 0.15f);
-
+void drawMonitor(const SensorData& data, const Thresholds& thresholds) {
+  char line[32];
+  // 屏幕高度只有 64 像素：14 像素标题 + 4 行 12 像素正好容纳所有数据。
   u8g2_ClearBuffer(&oled);
   u8g2_SetFont(&oled, u8g2_font_wqy12_t_gb2312);
-  u8g2_SetDrawColor(&oled, 1);
 
-  // 标题栏反色
   u8g2_DrawBox(&oled, 0, 0, 128, 14);
   u8g2_SetDrawColor(&oled, 0);
-  u8g2_DrawUTF8(&oled, 2, 12, "教室环境监测");
+  // 标题按需求固定为“环境质量看板”；操作提示让位给更清晰的主标题。
+  u8g2_DrawUTF8(&oled, 2, 12, "环境质量看板");
   u8g2_SetDrawColor(&oled, 1);
-  u8g2_DrawLine(&oled, 0, 15, 128, 15);
 
-  // 光照 + 进度条
-  snprintf(buf, sizeof(buf), "光照: %.0f%%", d.light);
-  u8g2_DrawUTF8(&oled, 4, static_cast<int>(animY[0]), buf);
-  auto bw = static_cast<int>(d.light * 0.6f); if (bw > 60) bw = 60;
-  if (bw > 0) u8g2_DrawRBox(&oled, 68, static_cast<int>(animY[0]) - 9, bw, 8, 2);
+  snprintf(line, sizeof(line), "光照: %3.0f%%", data.lightPercent);
+  u8g2_DrawUTF8(&oled, 2, 26, line);
+  drawAlertMark(26, exceeds(data.lightPercent, thresholds.lightPercent));
 
-  // 空气 + 进度条
-  if (mq135Ready) {
-    snprintf(buf, sizeof(buf), "空气: %.0fppm", d.aqi);
+  // 预热期间展示 raw ADC 而非不可信的 ppm；这样也能验证 MQ135 AO 接线。
+  if (data.mq135WarmedUp) {
+    snprintf(line, sizeof(line), "空气: %4.0fppm", data.mq135PpmEstimate);
   } else {
-    snprintf(buf, sizeof(buf), "空气: 预热中...");
+    snprintf(line, sizeof(line), "空气:预热 %4u", data.mq135Raw);
   }
-  u8g2_DrawUTF8(&oled, 4, static_cast<int>(animY[1]), buf);
-  if (mq135Ready) {
-    bw = static_cast<int>(d.aqi / 1000.0f * 60.0f); if (bw > 60) bw = 60;
-    if (bw > 0) u8g2_DrawRBox(&oled, 68, static_cast<int>(animY[1]) - 9, bw, 8, 2);
-  }
+  u8g2_DrawUTF8(&oled, 2, 38, line);
+  drawAlertMark(38, data.mq135WarmedUp && exceeds(data.mq135PpmEstimate, thresholds.mq135Ppm));
 
-  // 温度
-  snprintf(buf, sizeof(buf), "温度: %.1f°C", d.temp);
-  u8g2_DrawUTF8(&oled, 4, static_cast<int>(animY[2]), buf);
+  // DHT11 本轮读取失败时用占位符；不会画出上一轮缓存的数据。
+  if (data.dhtValid) snprintf(line, sizeof(line), "温度: %4.1fC", data.temperatureC);
+  else snprintf(line, sizeof(line), "温度: --.-C");
+  u8g2_DrawUTF8(&oled, 2, 50, line);
+  drawAlertMark(50, exceeds(data.temperatureC, thresholds.temperatureC));
 
-  // 湿度
-  snprintf(buf, sizeof(buf), "湿度: %.0f%%", d.humid);
-  u8g2_DrawUTF8(&oled, 4, static_cast<int>(animY[3]), buf);
+  if (data.dhtValid) snprintf(line, sizeof(line), "湿度: %4.0f%%", data.humidityPercent);
+  else snprintf(line, sizeof(line), "湿度: --%%");
+  u8g2_DrawUTF8(&oled, 2, 62, line);
+  drawAlertMark(62, exceeds(data.humidityPercent, thresholds.humidityPercent));
 
   u8g2_SendBuffer(&oled);
 }
 
-// ==================== 设置界面 ====================
-void drawSettings(float thresholds[4], int settingsIdx, bool editing) {
-  char buf[32];
+void drawSettings(const Thresholds& thresholds, uint8_t selectedIndex, bool editing) {
+  // 这里使用局部快照数组，仅用于把结构体按固定菜单顺序渲染；修改操作
+  // 仍由 main.cpp 统一完成，避免显示层拥有业务状态。
+  const char* labels[] = {"光照", "空气", "温度", "湿度"};
+  const float values[] = {thresholds.lightPercent, thresholds.mq135Ppm,
+                          thresholds.temperatureC, thresholds.humidityPercent};
+  const char* units[] = {"%", "ppm", "C", "%"};
+  char line[28];
 
   u8g2_ClearBuffer(&oled);
   u8g2_SetFont(&oled, u8g2_font_wqy12_t_gb2312);
-  u8g2_SetDrawColor(&oled, 1);
-
-  // 标题栏
   u8g2_DrawBox(&oled, 0, 0, 128, 14);
   u8g2_SetDrawColor(&oled, 0);
-  u8g2_DrawUTF8(&oled, 2, 12, "阈值设置");
+  u8g2_DrawUTF8(&oled, 2, 12, editing ? "调节阈值  短按确认" : "选择项目  短按调节");
   u8g2_SetDrawColor(&oled, 1);
-  u8g2_DrawLine(&oled, 0, 15, 128, 15);
 
-  // 4个阈值项
-  const char* labels[] = {"光照阈值", "空气阈值(PPM)", "温度阈值", "湿度阈值"};
-  for (int i = 0; i < 4; i++) {
-    int y = 26 + i * 12;  // 从y=26开始，避开标题栏
-    snprintf(buf, sizeof(buf), "%s: %.0f", labels[i], thresholds[i]);
-
-    if (i == settingsIdx) {
+  for (uint8_t i = 0; i < 4; ++i) {
+    // 基线从 26 到 62，每行相隔 12 像素，与 wqy12 字体高度匹配。
+    const uint8_t y = 26 + i * 12;
+    if (i == 2) snprintf(line, sizeof(line), "%s: %4.1f%s", labels[i], values[i], units[i]);
+    else snprintf(line, sizeof(line), "%s: %4.0f%s", labels[i], values[i], units[i]);
+    if (i == selectedIndex) {
       if (editing) {
-        u8g2_DrawBox(&oled, 0, y - 10, 128, 13);
+        // 实心反白代表“旋转会立即改数值”；边框仅代表当前光标位置。
+        u8g2_DrawBox(&oled, 0, y - 10, 128, 12);
         u8g2_SetDrawColor(&oled, 0);
-        u8g2_DrawUTF8(&oled, 4, y, buf);
+        u8g2_DrawUTF8(&oled, 3, y, line);
         u8g2_SetDrawColor(&oled, 1);
       } else {
-        u8g2_DrawRFrame(&oled, 0, y - 10, 128, 13, 2);
-        u8g2_DrawUTF8(&oled, 4, y, buf);
+        u8g2_DrawFrame(&oled, 0, y - 10, 128, 12);
+        u8g2_DrawUTF8(&oled, 3, y, line);
       }
     } else {
-      u8g2_DrawUTF8(&oled, 4, y, buf);
+      u8g2_DrawUTF8(&oled, 3, y, line);
     }
   }
-
-  // 底部提示（小字体，不遮挡）
-  u8g2_SetFont(&oled, u8g2_font_5x7_tf);
-  u8g2_DrawStr(&oled, 2, 63,
-    editing ? "Rotate:Adjust  Press:OK" : "Rotate:Select  Long:Back");
-
   u8g2_SendBuffer(&oled);
 }

@@ -26,9 +26,22 @@ ESP32-S3 教室环境监测器：SSD1306 OLED 实时显示光照、MQ135 和 DHT
 - 串口波特率为 `115200`，每两秒输出一次各模块读数，DHT11 失败时会给出接线检查提示。
 - EC11 也会输出调试信息：空闲时每秒一行，旋转/按键时立即输出一行。
 - 在主界面长按 EC11（≥800 ms）进入设置；旋转选择项目，短按进入调节；再次短按确认，长按返回主界面。
-- 阈值仅在本次运行期间保存；超阈值数据在 OLED 行末显示实心圆提示。
+- 阈值在短按确认时保存到 ESP32 本地 NVS；超阈值数据在 OLED 行末显示实心圆提示。
 
 阈值调节步长：光照/湿度为 1%，空气为 10 ppm，温度为 0.5°C。
+
+## 首次 Wi-Fi 配网与 WebUI
+
+首次上电（或保存的 Wi-Fi 连接失败时）设备会创建无密码热点 `RX-Classroom-demo`：
+
+- OLED 会显示热点 SSID、`无密码` 提示和配网页入口二维码。
+- 手机先连接该热点，再扫描二维码；未自动打开时访问 `http://192.168.4.1/`。
+- 在 WebUI 点击“扫描附近 Wi-Fi”后，SSID 输入框可选择扫描结果；隐藏网络也可以手动输入名称。
+- 在 WebUI 填写路由器的 SSID 和密码并提交。设备会关闭配网热点、连接路由器；连接失败 15 秒后会自动重新开启配网热点。
+- OLED 的光标默认停在“暂不连接”，短按 EC11 可关闭热点并进入离线监测，已保存凭据不会被删除；此选项不在 WebUI 显示。
+- 已成功配网后，在同一局域网使用串口日志中显示的 IP 地址访问 WebUI，可查看光照、空气、温湿度的实时数据，也可清除 Wi-Fi 并重新配网。
+
+Wi-Fi 名称和密码存入 ESP32 本地 NVS，不会上传到任何服务器；阈值使用独立的 NVS 命名空间，不会被清除 Wi-Fi 操作影响。设备只在开机时自动尝试一次已保存的 Wi-Fi，运行中断线不会反复重连；连接失败才进入配网。
 
 ## EC11 串口调试
 
@@ -56,11 +69,18 @@ pio device monitor -b 115200
 ```text
 include/
   control.h      # EC11 输入接口与引脚
+  environment_status.h # 告警判断结果
+  network_portal.h # 本地热点配网和 WebUI
   sensors.h      # 三类传感器采集接口与引脚
-  SSD1306.h      # OLED 绘制接口、阈值定义与引脚
+  SSD1306.h      # OLED 绘制接口与引脚
+  threshold_store.h # 阈值 NVS 存储
+  thresholds.h   # 阈值数据模型
 src/
   control.cpp    # 编码器中断与按键消抖
+  environment_status.cpp # 传感器超限判断
+  network_portal.cpp # Wi-Fi 配网、DNS 引导、WebUI、凭据 NVS
   sensors.cpp    # ADC 平均采样、DHT11 检测、串口诊断
   SSD1306.cpp    # 监测与设置界面
-  main.cpp       # 应用状态机
+  threshold_store.cpp # 阈值 NVS 校验与保存
+  main.cpp       # 传感器与界面判断调度
 ```

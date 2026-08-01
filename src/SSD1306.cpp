@@ -1,19 +1,34 @@
 /** @file SSD1306.cpp */
 #include "SSD1306.h"
 
-#include <math.h>
+#include <qrcode.h>
 
 namespace {
 // U8g2 的全缓冲对象。128x64 单色屏需要约 1 KB RAM，ESP32-S3 足够使用。
 u8g2_t oled;
 
-// NAN 与任何数比较都为 false；显式判断可确保传感器失效时不会误告警。
-bool exceeds(float value, float threshold) { return !isnan(value) && value > threshold; }
-
 void drawAlertMark(uint8_t y, bool alert) {
   if (!alert) return;
   // 固定画在右侧，不能覆盖最多约 100 像素宽的中文/数值文本。
   u8g2_DrawDisc(&oled, 122, y - 5, 3, U8G2_DRAW_ALL);
+}
+
+void drawQrCode(esp_qrcode_handle_t qrCode) {
+  const int size = esp_qrcode_get_size(qrCode);
+  // 配网页面的 URL 很短，通常是 25x25 模块；以 2 像素绘制后仍可
+  // 在左侧区域留下足够的白边，普通手机相机可稳定识别。
+  constexpr int kModulePixels = 2;
+  // 二维码四周保留至少 4 个模块的白色静区，扫描器更容易定位图案。
+  constexpr int kLeft = 8;
+  constexpr int kTop = 8;
+  for (int y = 0; y < size; ++y) {
+    for (int x = 0; x < size; ++x) {
+      if (esp_qrcode_get_module(qrCode, x, y)) {
+        u8g2_DrawBox(&oled, kLeft + x * kModulePixels, kTop + y * kModulePixels,
+                     kModulePixels, kModulePixels);
+      }
+    }
+  }
 }
 }  // namespace
 
@@ -39,7 +54,38 @@ void drawBootScreen() {
   u8g2_SendBuffer(&oled);
 }
 
-void drawMonitor(const SensorData& data, const Thresholds& thresholds) {
+void drawProvisioningScreen(const char* ssid, const char* qrPayload) {
+  u8g2_ClearBuffer(&oled);
+  // 二维码回调直接写入同一个帧缓冲；生成失败时仍会显示文字配网说明。
+  esp_qrcode_config_t config = ESP_QRCODE_CONFIG_DEFAULT();
+  config.display_func = drawQrCode;
+  config.max_qrcode_version = 2;
+  config.qrcode_ecc_level = ESP_QRCODE_ECC_LOW;
+  esp_qrcode_generate(&config, qrPayload);
+
+  u8g2_SetFont(&oled, u8g2_font_wqy12_t_gb2312);
+  u8g2_DrawUTF8(&oled, 62, 17, "WiFi配网");
+  u8g2_SetFont(&oled, u8g2_font_5x7_tf);
+  u8g2_DrawStr(&oled, 62, 31, "SSID:");
+  u8g2_DrawStr(&oled, 62, 40, ssid);
+  u8g2_SetFont(&oled, u8g2_font_wqy12_t_gb2312);
+  u8g2_DrawUTF8(&oled, 62, 52, "无密码");
+  // 配网页只有一个本地操作，光标始终指向它；短按 EC11 即确认离线监测。
+  u8g2_DrawUTF8(&oled, 62, 63, ">暂不连接");
+  u8g2_SendBuffer(&oled);
+}
+
+void drawNetworkConnectingScreen(const char* ssid) {
+  u8g2_ClearBuffer(&oled);
+  u8g2_SetFont(&oled, u8g2_font_wqy12_t_gb2312);
+  u8g2_DrawUTF8(&oled, 8, 25, "正在连接 WiFi");
+  u8g2_SetFont(&oled, u8g2_font_5x7_tf);
+  u8g2_DrawStr(&oled, 8, 42, ssid);
+  u8g2_DrawStr(&oled, 8, 56, "Please wait...");
+  u8g2_SendBuffer(&oled);
+}
+
+void drawMonitor(const SensorData& data, const EnvironmentStatus& status) {
   char line[32];
   // 屏幕高度只有 64 像素：14 像素标题 + 4 行 12 像素正好容纳所有数据。
   u8g2_ClearBuffer(&oled);
@@ -53,7 +99,7 @@ void drawMonitor(const SensorData& data, const Thresholds& thresholds) {
 
   snprintf(line, sizeof(line), "光照: %3.0f%%", data.lightPercent);
   u8g2_DrawUTF8(&oled, 2, 26, line);
-  drawAlertMark(26, exceeds(data.lightPercent, thresholds.lightPercent));
+  drawAlertMark(26, status.lightAlert);
 
   // 预热期间展示 raw ADC 而非不可信的 ppm；这样也能验证 MQ135 AO 接线。
   if (data.mq135WarmedUp) {
@@ -62,18 +108,18 @@ void drawMonitor(const SensorData& data, const Thresholds& thresholds) {
     snprintf(line, sizeof(line), "空气:预热 %4u", data.mq135Raw);
   }
   u8g2_DrawUTF8(&oled, 2, 38, line);
-  drawAlertMark(38, data.mq135WarmedUp && exceeds(data.mq135PpmEstimate, thresholds.mq135Ppm));
+  drawAlertMark(38, status.airAlert);
 
   // DHT11 本轮读取失败时用占位符；不会画出上一轮缓存的数据。
   if (data.dhtValid) snprintf(line, sizeof(line), "温度: %4.1fC", data.temperatureC);
   else snprintf(line, sizeof(line), "温度: --.-C");
   u8g2_DrawUTF8(&oled, 2, 50, line);
-  drawAlertMark(50, exceeds(data.temperatureC, thresholds.temperatureC));
+  drawAlertMark(50, status.temperatureAlert);
 
   if (data.dhtValid) snprintf(line, sizeof(line), "湿度: %4.0f%%", data.humidityPercent);
   else snprintf(line, sizeof(line), "湿度: --%%");
   u8g2_DrawUTF8(&oled, 2, 62, line);
-  drawAlertMark(62, exceeds(data.humidityPercent, thresholds.humidityPercent));
+  drawAlertMark(62, status.humidityAlert);
 
   u8g2_SendBuffer(&oled);
 }

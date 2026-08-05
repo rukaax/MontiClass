@@ -15,17 +15,20 @@ constexpr char kWifiNamespace[] = "wifi_config";
 constexpr char kSsidKey[] = "ssid";
 constexpr char kPasswordKey[] = "password";
 constexpr uint32_t kConnectionTimeoutMs = 15000;
-// 首次配网在没有任何手机连接热点时，1 分钟后自动进入离线监测模式。
-constexpr uint32_t kProvisioningNoClientTimeoutMs = 60000;
+// 配网提示页显示 1 分钟，之后 OLED 回到监测页，但热点和 WebUI 保留。
+constexpr uint32_t kProvisioningScreenTimeoutMs = 60000;
+constexpr uint32_t kApHealthCheckIntervalMs = 5000;
+constexpr uint8_t kNetworkScanMaxAttempts = 3;
 
 const char kWebPage[] PROGMEM = R"HTML(<!doctype html>
 <html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>教室环境监测器</title><style>
-body{max-width:680px;margin:24px auto;padding:0 16px;font:16px system-ui;color:#172033;background:#f5f7fb}h1{font-size:1.6rem}.card{background:#fff;border-radius:12px;padding:16px;margin:12px 0;box-shadow:0 2px 10px #0001}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.value{font-size:1.25rem;font-weight:700}label,input,select,button{display:block;width:100%;box-sizing:border-box;margin:8px 0}input,select,button{padding:10px;border-radius:7px;border:1px solid #ccd3df}button{background:#2563eb;color:white;border:0;font-weight:700}.muted{color:#596579;font-size:.9rem}</style>
+body{max-width:680px;margin:24px auto;padding:0 16px;font:16px system-ui;color:#172033;background:#f5f7fb}h1{font-size:1.6rem}.card{background:#fff;border-radius:12px;padding:16px;margin:12px 0;box-shadow:0 2px 10px #0001}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.value{font-size:1.25rem;font-weight:700}label,input,select,textarea,button{display:block;width:100%;box-sizing:border-box;margin:8px 0}input,select,textarea,button{padding:10px;border-radius:7px;border:1px solid #ccd3df}button{background:#2563eb;color:white;border:0;font-weight:700}.muted{color:#596579;font-size:.9rem}</style>
 <body><h1>教室环境监测器</h1><p id="network" class="muted">加载中…</p>
-<section class="card"><h2>实时数据</h2><div class="grid"><div>光照<div id="light" class="value">--</div></div><div>空气<div id="air" class="value">--</div></div><div>温度<div id="temperature" class="value">--</div></div><div>湿度<div id="humidity" class="value">--</div></div></div></section>
-<section class="card"><h2>Wi-Fi 配网</h2><p class="muted">扫描后从下拉框选择附近网络；隐藏网络可选“手动输入”。保存后设备将关闭配网热点并尝试连接。</p><button id="scanButton" type="button" onclick="networks()">扫描附近 Wi-Fi</button><p id="scanStatus" class="muted">尚未扫描</p><form method="post" action="/api/wifi"><label>Wi-Fi 名称（SSID）<select id="ssidSelect" name="ssid" onchange="chooseSsid()"><option value="">请先扫描并选择</option><option value="__manual__">手动输入隐藏网络…</option></select><input id="ssidManual" maxlength="32" placeholder="输入隐藏网络名称" hidden></label><label>密码（开放网络可留空）<input name="password" type="password" maxlength="63"></label><button type="submit">保存并连接</button></form><form method="post" action="/api/wifi/reset" onsubmit="return confirm('清除已保存的 Wi-Fi？')"><button type="submit">清除 Wi-Fi，重新配网</button></form></section>
-<script>const unit={light:'%',air:' ppm',temperature:' °C',humidity:'%'};function val(v,k){return v===null?'--':v+unit[k]}async function refresh(){try{let s=await (await fetch('/api/status',{cache:'no-store'})).json();for(let k of Object.keys(unit))document.getElementById(k).textContent=val(s[k],k);document.getElementById('network').textContent=s.provisioning?'配网热点：'+s.apSsid+'（无密码）':'设备 IP：'+s.ip}catch(e){document.getElementById('network').textContent='读取设备状态失败'}}function chooseSsid(){let s=document.getElementById('ssidSelect'),m=document.getElementById('ssidManual'),manual=s.value==='__manual__';m.hidden=!manual;m.name=manual?'ssid':'';s.name=manual?'':'ssid';m.required=manual}async function networks(){let b=document.getElementById('scanButton'),t=document.getElementById('scanStatus'),s=document.getElementById('ssidSelect');try{b.disabled=true;b.textContent='正在扫描…';t.textContent='正在扫描附近 Wi-Fi，请稍候…';let n=await (await fetch('/api/networks')).json();if(n.scanning){setTimeout(networks,800);return}s.replaceChildren(new Option('请选择 Wi-Fi',''),new Option('手动输入隐藏网络…','__manual__'));n.networks.forEach(name=>s.add(new Option(name,name)));t.textContent=n.networks.length?'扫描完成，找到 '+n.networks.length+' 个网络。':'扫描完成，未找到网络。';b.disabled=false;b.textContent='重新扫描'}catch(e){t.textContent='扫描失败，请重试。';b.disabled=false;b.textContent='扫描附近 Wi-Fi'}}refresh();setInterval(refresh,2000);</script></body></html>)HTML";
+<section class="card"><h2>实时数据</h2><div class="grid"><div>光照 1<div id="light" class="value">--</div></div><div>光照 2<div id="light2" class="value">--</div></div><div>空气 AQI（估算）<div id="air" class="value">--</div><div id="airDetail" class="muted">预热并建立基线中…</div></div><div>温度<div id="temperature" class="value">--</div></div><div>湿度<div id="humidity" class="value">--</div></div><div>人体存在<div id="presence" class="value">--</div></div></div></section>
+<section class="card"><h2>Wi-Fi 配网</h2><p class="muted">扫描后从下拉框选择附近网络；隐藏网络可选“手动输入”。保存后设备将关闭配网热点并尝试连接。</p><button id="scanButton" type="button" onclick="networks(true)">扫描附近 Wi-Fi</button><p id="scanStatus" class="muted">尚未扫描</p><form method="post" action="/api/wifi"><label>Wi-Fi 名称（SSID）<select id="ssidSelect" name="ssid" onchange="chooseSsid()"><option value="">请先扫描并选择</option><option value="__manual__">手动输入隐藏网络…</option></select><input id="ssidManual" maxlength="32" placeholder="输入隐藏网络名称" hidden></label><label>密码（开放网络可留空）<input name="password" type="password" maxlength="63"></label><button type="submit">保存并连接</button></form><form method="post" action="/api/wifi/reset" onsubmit="return confirm('清除已保存的 Wi-Fi？')"><button type="submit">清除 Wi-Fi，重新配网</button></form></section>
+<section class="card"><h2>数据上报</h2><p class="muted">设备 ID：<span id="reportDeviceId">--</span></p><form id="reportingForm" onsubmit="saveReporting(event)"><label>API Base URL<input id="reportBaseUrl" name="base_url" type="url" maxlength="240" placeholder="http://192.168.1.100:3001/api" required></label><label>设备 Token<input id="reportToken" name="token" type="password" maxlength="512" placeholder="已配置时留空可保留"></label><label>数据上报间隔（秒）<input id="reportInterval" name="report_interval" type="number" min="1" max="86400" step="1" required></label><label>心跳间隔（秒，0=关闭）<input id="heartbeatInterval" name="heartbeat_interval" type="number" min="0" max="86400" step="1" required></label><label>自定义请求头（每行：名称: 值）<textarea id="reportHeaders" name="headers" maxlength="1024" rows="4" placeholder="X-Classroom: 101"></textarea></label><p class="muted">Authorization、Content-Type、Host 等鉴权和协议头由设备自动管理。</p><button type="submit">保存上报配置</button></form><div class="grid"><button type="button" onclick="manualReport()">立即上报当前数据</button><button type="button" onclick="clearReportLogs()">清空回调日志</button></div><p id="reportStatus" class="muted">读取配置中…</p><pre id="reportLogs" class="muted" style="white-space:pre-wrap;max-height:260px;overflow:auto">暂无回调日志</pre></section>
+<script>const unit={light:'%',light2:'%',air:' AQI',temperature:' °C',humidity:'%'};function val(v,k){return v===null?'--':v+unit[k]}async function refresh(){try{let s=await (await fetch('/api/status',{cache:'no-store'})).json();for(let k of Object.keys(unit))document.getElementById(k).textContent=val(s[k],k);document.getElementById('presence').textContent=s.presence?'有人':'无人';document.getElementById('airDetail').textContent=s.airReady?'基线 ADC '+s.airBaseline+' · 当前 '+s.airRaw+' / GPIO '+s.airMv+' mV':'预热并建立基线中 · ADC '+s.airRaw+' / GPIO '+s.airMv+' mV';document.getElementById('network').textContent=s.provisioning?'配网热点：'+s.apSsid+'（无密码）':'设备 IP：'+s.ip}catch(e){document.getElementById('network').textContent='读取设备状态失败'}}function chooseSsid(){let s=document.getElementById('ssidSelect'),m=document.getElementById('ssidManual'),manual=s.value==='__manual__';m.hidden=!manual;m.name=manual?'ssid':'';s.name=manual?'':'ssid';m.required=manual}async function networks(start=false){let b=document.getElementById('scanButton'),t=document.getElementById('scanStatus'),s=document.getElementById('ssidSelect');try{b.disabled=true;b.textContent='正在扫描…';t.textContent='正在扫描附近 Wi-Fi，请稍候…';let n=await (await fetch('/api/networks'+(start?'?start=1':''),{cache:'no-store'})).json();if(n.scanning){setTimeout(()=>networks(false),800);return}if(n.error)throw new Error(n.error);s.replaceChildren(new Option('请选择 Wi-Fi',''),new Option('手动输入隐藏网络…','__manual__'));n.networks.forEach(name=>s.add(new Option(name,name)));t.textContent=n.networks.length?'扫描完成，找到 '+n.networks.length+' 个网络。':'扫描完成，未找到网络。';b.disabled=false;b.textContent='重新扫描'}catch(e){t.textContent='扫描失败，请重试。';b.disabled=false;b.textContent='扫描附近 Wi-Fi'}}async function reporting(){let t=document.getElementById('reportStatus');try{let r=await (await fetch('/api/reporting',{cache:'no-store'})).json();document.getElementById('reportDeviceId').textContent=r.deviceId;document.getElementById('reportBaseUrl').value=r.baseUrl;if(!r.configured)t.textContent='尚未配置';else if(r.lastHttpCode===201)t.textContent='已配置，上次上报成功';else if(r.lastHttpCode>0)t.textContent='已配置，上次上报 HTTP '+r.lastHttpCode;else if(r.lastHttpCode<0)t.textContent='已配置，上次上报网络错误 '+r.lastHttpCode;else t.textContent='已配置，等待上报'}catch(e){t.textContent='读取上报配置失败'}}async function saveReporting(e){e.preventDefault();let t=document.getElementById('reportStatus');try{t.textContent='正在保存…';let r=await fetch('/api/reporting',{method:'POST',body:new URLSearchParams(new FormData(e.target))});let j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error);document.getElementById('reportToken').value='';t.textContent='保存成功，联网后将自动上报';setTimeout(reporting,1200)}catch(e){t.textContent='保存失败，请检查地址和 Token'}}refresh();reporting();setInterval(refresh,2000);setInterval(reporting,10000);</script><script>async function loadReportControls(){try{let r=await (await fetch('/api/reporting',{cache:'no-store'})).json();document.getElementById('reportInterval').value=r.reportIntervalSec;document.getElementById('heartbeatInterval').value=r.heartbeatIntervalSec;document.getElementById('reportHeaders').value=r.customHeaders||''}catch(e){}}const originalSaveReporting=saveReporting;saveReporting=async function(e){await originalSaveReporting(e);setTimeout(loadReportControls,1200)}async function manualReport(){let t=document.getElementById('reportStatus');try{t.textContent='正在上报当前数据…';let r=await fetch('/api/reporting/send',{method:'POST'}),j=await r.json();t.textContent=r.ok&&j.ok?'手动上报已排队':('手动上报失败：'+(j.error||r.status))}catch(e){t.textContent='手动上报请求失败'}}async function reportingLogs(){try{let r=await (await fetch('/api/reporting/logs',{cache:'no-store'})).json(),p=document.getElementById('reportLogs');if(!r.length){p.textContent='暂无回调日志';return}p.textContent=r.slice().reverse().map(x=>'启动后 '+Math.floor(x.timeMs/1000)+'s ['+x.kind+'] HTTP '+x.code+' bytes='+x.requestBytes+'\n'+x.response).join('\n\n')}catch(e){}}async function clearReportLogs(){await fetch('/api/reporting/logs/clear',{method:'POST'});reportingLogs()}loadReportControls();reportingLogs();setInterval(loadReportControls,10000);setInterval(reportingLogs,3000);</script></body></html>)HTML";
 
 String jsonNumber(float value, uint8_t digits) {
   return isnan(value) ? "null" : String(value, static_cast<unsigned int>(digits));
@@ -46,6 +49,7 @@ String escapeJson(const String& value) {
 }  // namespace
 
 void NetworkPortal::configureRoutes() {
+  reportUploader_.configureRoutes(server_);
   server_.on("/", HTTP_GET, [this]() { server_.send_P(200, "text/html; charset=utf-8", kWebPage); });
   server_.on("/api/status", HTTP_GET, [this]() { sendStatus(); });
   server_.on("/api/networks", HTTP_GET, [this]() { sendNetworks(); });
@@ -93,6 +97,7 @@ void NetworkPortal::clearCredentials() {
 void NetworkPortal::startProvisioning() {
   // AP+STA 允许配网页在不掉热点的情况下扫描附近路由器。
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
   // 只有 Wi-Fi 模式启动后，lwIP 的邮箱才已建立；此时才能安全断开旧 STA。
   WiFi.disconnect(false, false);
   WiFi.scanDelete();
@@ -106,14 +111,15 @@ void NetworkPortal::startProvisioning() {
   }
   dnsServer_.start(53, "*", WiFi.softAPIP());
   provisioning_ = true;
+  provisioningScreenVisible_ = true;
   connecting_ = false;
   connectionSucceeded_ = false;
   provisioningStartedMs_ = millis();
-  provisioningClientSeen_ = false;
-  networkListJson_ = "{\"networks\":[],\"scanning\":false}";
+  lastApHealthCheckMs_ = provisioningStartedMs_;
+  networkListJson_ = "{\"networks\":[],\"scanning\":false,\"error\":\"\"}";
   // 固定热点名较长；二维码编码入口 URL 可保持足够大的模块和白边，扫描更可靠。
   drawProvisioningScreen(apSsid_.c_str(), "http://192.168.4.1/");
-  Serial.printf("[WiFi] provisioning AP: %s (open), portal: http://%s\n",
+  Serial.printf("[WiFi] provisioning AP: %s (open), portal: http://%s\r\n",
                 apSsid_.c_str(), WiFi.softAPIP().toString().c_str());
 }
 
@@ -127,23 +133,15 @@ void NetworkPortal::startStation(const String& ssid, const String& password) {
   pendingPassword_ = password;
   connectionStartedMs_ = millis();
   provisioning_ = false;
+  provisioningScreenVisible_ = false;
   connecting_ = true;
   connectionSucceeded_ = false;
   drawNetworkConnectingScreen(ssid.c_str());
-  Serial.printf("[WiFi] connecting to saved SSID: %s\n", ssid.c_str());
-}
-
-void NetworkPortal::startOffline() {
-  dnsServer_.stop();
-  WiFi.disconnect(false, false);
-  WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_OFF);
-  provisioning_ = false;
-  connecting_ = false;
-  Serial.println("[WiFi] offline mode selected; network is only retried on next boot");
+  Serial.printf("[WiFi] connecting to saved SSID: %s\r\n", ssid.c_str());
 }
 
 void NetworkPortal::begin() {
+  reportUploader_.begin();
   configureRoutes();
   // persistent() 不写入 Arduino Wi-Fi 默认存储，凭据只由本模块的 NVS 管理。
   WiFi.persistent(false);
@@ -160,10 +158,16 @@ void NetworkPortal::begin() {
 void NetworkPortal::sendStatus() {
   const SensorData emptyData{};
   const SensorData& data = latestData_ == nullptr ? emptyData : *latestData_;
-  String response = "{\"light\":" + jsonNumber(data.lightPercent, 0) +
-                    ",\"air\":" + (data.mq135WarmedUp ? jsonNumber(data.mq135PpmEstimate, 0) : "null") +
+  String response = "{\"light\":" + jsonNumber(data.light1Percent, 0) +
+                    ",\"light2\":" + jsonNumber(data.light2Percent, 0) +
+                    ",\"air\":" + (data.mq135WarmedUp ? jsonNumber(data.mq135AqiEstimate, 0) : "null") +
+                    ",\"airRaw\":" + String(data.mq135Raw) +
+                    ",\"airMv\":" + String(data.mq135MilliVolts) +
+                    ",\"airBaseline\":" + String(data.mq135BaselineRaw) +
+                    ",\"airReady\":" + (data.mq135WarmedUp ? "true" : "false") +
                     ",\"temperature\":" + (data.dhtValid ? jsonNumber(data.temperatureC, 1) : "null") +
                     ",\"humidity\":" + (data.dhtValid ? jsonNumber(data.humidityPercent, 0) : "null") +
+                    ",\"presence\":" + (data.presenceDetected ? "true" : "false") +
                     ",\"provisioning\":" + (provisioning_ ? "true" : "false") +
                     ",\"apSsid\":\"" + apSsid_ + "\",\"ip\":\"" +
                     (provisioning_ ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) + "\"}";
@@ -173,24 +177,54 @@ void NetworkPortal::sendStatus() {
 
 void NetworkPortal::sendNetworks() {
   if (!provisioning_) {
-    server_.send(409, "application/json", "{\"networks\":[],\"scanning\":false}");
+    server_.send(409, "application/json", "{\"networks\":[],\"scanning\":false,\"error\":\"not_provisioning\"}");
     return;
   }
-  // 仅由 WebUI 的“扫描附近 Wi-Fi”按钮触发；不再在后台周期性扫描。
-  if (!networkScanRunning_) {
+  // start=1 只由按钮发出；后续轮询不再误触发新扫描或覆盖完成结果。
+  if (server_.hasArg("start") && server_.arg("start") == "1" && !networkScanRunning_) {
     networkListJson_ = "{\"networks\":[],\"scanning\":true}";
+    networkScanAttempt_ = 0;
     startNetworkScan();
   }
+  server_.sendHeader("Cache-Control", "no-store");
   server_.send(200, "application/json", networkListJson_);
 }
 
-void NetworkPortal::startNetworkScan() {
-  if (!provisioning_ || networkScanRunning_) return;
+bool NetworkPortal::startNetworkScan() {
+  if (!provisioning_ || networkScanRunning_) return false;
   // 必须异步扫描：同步扫全信道会堵住 OLED、传感器和串口数秒。
   WiFi.scanDelete();
-  WiFi.scanNetworks(true, true);
+  ++networkScanAttempt_;
+  // 200ms/信道可覆盖全部 2.4GHz 信道，同时缩短 AP 暂停发 beacon 的时间。
+  const int scanState = WiFi.scanNetworks(true, false, false, 200);
+  if (scanState != WIFI_SCAN_RUNNING) {
+    Serial.printf("[WiFi] scan start failed: attempt=%u/%u state=%d mode=%d\r\n",
+                  networkScanAttempt_, kNetworkScanMaxAttempts, scanState,
+                  static_cast<int>(WiFi.getMode()));
+    if (networkScanAttempt_ < kNetworkScanMaxAttempts) return startNetworkScan();
+    networkListJson_ = "{\"networks\":[],\"scanning\":false,\"error\":\"scan_start_failed\"}";
+    return false;
+  }
   networkScanRunning_ = true;
   lastNetworkScanMs_ = millis();
+  Serial.printf("[WiFi] network scan started: attempt=%u/%u stations=%u\r\n",
+                networkScanAttempt_, kNetworkScanMaxAttempts, WiFi.softAPgetStationNum());
+  return true;
+}
+
+void NetworkPortal::ensureProvisioningAp() {
+  if (!provisioning_) return;
+  const wifi_mode_t mode = WiFi.getMode();
+  const bool apModeActive = mode == WIFI_AP || mode == WIFI_AP_STA;
+  if (apModeActive && WiFi.softAPSSID() == apSsid_) return;
+
+  Serial.printf("[WiFi] AP watchdog restoring hotspot: mode=%d ssid=%s\r\n",
+                static_cast<int>(mode), WiFi.softAPSSID().c_str());
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  WiFi.softAP(apSsid_.c_str());
+  dnsServer_.stop();
+  dnsServer_.start(53, "*", WiFi.softAPIP());
 }
 
 void NetworkPortal::receiveCredentials() {
@@ -215,33 +249,58 @@ void NetworkPortal::update(const SensorData& latestData) {
   latestData_ = &latestData;
   if (provisioning_) {
     dnsServer_.processNextRequest();
-    // 配网页始终占屏，不再循环切换。只要有设备曾连上热点，就交由用户完成
-    // 配网或手动选择“暂不连接”；无人连接才在一分钟后自动退出。
-    if (WiFi.softAPgetStationNum() > 0) provisioningClientSeen_ = true;
-    if (!provisioningClientSeen_ && millis() - provisioningStartedMs_ >= kProvisioningNoClientTimeoutMs) {
-      Serial.println("[WiFi] no provisioning client after 60s; entering offline mode");
-      startOffline();
-      return;
+    if (millis() - lastApHealthCheckMs_ >= kApHealthCheckIntervalMs) {
+      lastApHealthCheckMs_ = millis();
+      ensureProvisioningAp();
+    }
+    // 一分钟后只释放 OLED 给监测页面，不能关闭 AP；用户仍可随时连接热点
+    // RX-Classroom-demo 并访问 192.168.4.1 完成配网。
+    if (provisioningScreenVisible_ &&
+        millis() - provisioningStartedMs_ >= kProvisioningScreenTimeoutMs) {
+      provisioningScreenVisible_ = false;
+      Serial.println("[WiFi] provisioning screen hidden after 60s; AP and portal remain active");
     }
 
     if (networkScanRunning_) {
       const int found = WiFi.scanComplete();
       if (found >= 0) {
         String response = "{\"networks\":[";
+        int appended = 0;
         for (int i = 0; i < found; ++i) {
-          if (i != 0) response += ',';
+          const String ssid = WiFi.SSID(i);
+          if (ssid.isEmpty()) continue;
+          bool duplicate = false;
+          for (int j = 0; j < i; ++j) {
+            if (WiFi.SSID(j) == ssid) {
+              duplicate = true;
+              break;
+            }
+          }
+          if (duplicate) continue;
+          if (appended++ != 0) response += ',';
           response += '"';
-          response += escapeJson(WiFi.SSID(i));
+          response += escapeJson(ssid);
           response += '"';
         }
-        networkListJson_ = response + "],\"scanning\":false}";
+        networkListJson_ = response + "],\"scanning\":false,\"error\":\"\"}";
         WiFi.scanDelete();
         networkScanRunning_ = false;
         lastNetworkScanMs_ = millis();
+        Serial.printf("[WiFi] scan completed: %d AP records, %d unique SSIDs\r\n", found, appended);
       } else if (found == WIFI_SCAN_FAILED) {
-        networkListJson_ = "{\"networks\":[],\"scanning\":false}";
+        const uint32_t elapsedMs = millis() - lastNetworkScanMs_;
         networkScanRunning_ = false;
-        lastNetworkScanMs_ = millis();
+        WiFi.scanDelete();
+        Serial.printf("[WiFi] scan failed: attempt=%u/%u elapsed=%lums mode=%d stations=%u\r\n",
+                      networkScanAttempt_, kNetworkScanMaxAttempts,
+                      static_cast<unsigned long>(elapsedMs), static_cast<int>(WiFi.getMode()),
+                      WiFi.softAPgetStationNum());
+        if (networkScanAttempt_ < kNetworkScanMaxAttempts) {
+          networkListJson_ = "{\"networks\":[],\"scanning\":true}";
+          startNetworkScan();
+        } else {
+          networkListJson_ = "{\"networks\":[],\"scanning\":false,\"error\":\"scan_failed\"}";
+        }
       }
     }
   }
@@ -252,29 +311,33 @@ void NetworkPortal::update(const SensorData& latestData) {
     pendingStationStart_ = false;
     startStation(pendingSsid_, pendingPassword_);
   }
-  if (!connecting_) return;
-
-  if (WiFi.status() == WL_CONNECTED) {
-    connecting_ = false;
-    connectionSucceeded_ = true;
-    Serial.printf("[WiFi] connected: http://%s\n", WiFi.localIP().toString().c_str());
-  } else if (millis() - connectionStartedMs_ >= kConnectionTimeoutMs) {
-    Serial.println("[WiFi] connection timed out; reopening provisioning AP");
-    startProvisioning();
+  if (connecting_) {
+    if (WiFi.status() == WL_CONNECTED) {
+      connecting_ = false;
+      connectionSucceeded_ = true;
+      Serial.printf("[WiFi] connected: http://%s\r\n", WiFi.localIP().toString().c_str());
+    } else if (millis() - connectionStartedMs_ >= kConnectionTimeoutMs) {
+      Serial.println("[WiFi] connection timed out; reopening provisioning AP");
+      startProvisioning();
+    }
   }
+  reportUploader_.update(latestData);
 }
 
 bool NetworkPortal::isShowingNetworkScreen() const {
-  return provisioning_ || connecting_;
+  return (provisioning_ && provisioningScreenVisible_) || connecting_;
+}
+
+bool NetworkPortal::isStationConnected() const {
+  return !provisioning_ && !connecting_ && WiFi.status() == WL_CONNECTED;
+}
+
+String NetworkPortal::stationIpAddress() const {
+  return isStationConnected() ? WiFi.localIP().toString() : String();
 }
 
 bool NetworkPortal::takeConnectionSucceeded() {
   const bool succeeded = connectionSucceeded_;
   connectionSucceeded_ = false;
   return succeeded;
-}
-
-void NetworkPortal::handleProvisioningInput(bool shortPress) {
-  // OLED 的光标固定停在“暂不连接”，短按即确认；该操作不通过 WebUI 暴露。
-  if (provisioning_ && shortPress) startOffline();
 }

@@ -7,7 +7,8 @@
 namespace {
 constexpr char kPreferencesNamespace[] = "envboard";
 constexpr char kThresholdsKey[] = "thresholds";
-constexpr uint32_t kThresholdsMagic = 0x454E5631;  // "ENV1"
+// ENV3 将空气阈值改为 0..500 相对 AQI，旧百分比阈值不可直接复用。
+constexpr uint32_t kThresholdsMagic = 0x454E5633;  // "ENV3"
 
 struct StoredThresholds {
   uint32_t magic;
@@ -30,7 +31,7 @@ uint32_t checksumThresholds(const Thresholds& value) {
 
 bool thresholdsAreValid(const Thresholds& value) {
   return isfinite(value.lightPercent) && value.lightPercent >= 0.0f && value.lightPercent <= 100.0f &&
-         isfinite(value.mq135Ppm) && value.mq135Ppm >= 0.0f && value.mq135Ppm <= 2000.0f &&
+         isfinite(value.mq135Aqi) && value.mq135Aqi >= 0.0f && value.mq135Aqi <= 500.0f &&
          isfinite(value.temperatureC) && value.temperatureC >= 0.0f && value.temperatureC <= 60.0f &&
          isfinite(value.humidityPercent) && value.humidityPercent >= 0.0f && value.humidityPercent <= 100.0f;
 }
@@ -48,8 +49,8 @@ bool thresholdStoreBegin(Thresholds& thresholds) {
   if (bytesRead == sizeof(stored) && stored.magic == kThresholdsMagic &&
       stored.checksum == checksumThresholds(stored.values) && thresholdsAreValid(stored.values)) {
     thresholds = stored.values;
-    Serial.printf("[NVS] thresholds restored: L=%.0f%% MQ=%.0fppm T=%.1fC H=%.0f%%\n",
-                  thresholds.lightPercent, thresholds.mq135Ppm,
+    Serial.printf("[NVS] thresholds restored: L=%.0f%% AQI=%.0f T=%.1fC H=%.0f%%\r\n",
+                  thresholds.lightPercent, thresholds.mq135Aqi,
                   thresholds.temperatureC, thresholds.humidityPercent);
     return true;
   }
@@ -65,8 +66,8 @@ bool thresholdStoreSave(const Thresholds& thresholds) {
     Serial.println("[NVS] ERROR: threshold save failed");
     return false;
   }
-  Serial.printf("[NVS] thresholds saved: L=%.0f%% MQ=%.0fppm T=%.1fC H=%.0f%%\n",
-                thresholds.lightPercent, thresholds.mq135Ppm,
+  Serial.printf("[NVS] thresholds saved: L=%.0f%% AQI=%.0f T=%.1fC H=%.0f%%\r\n",
+                thresholds.lightPercent, thresholds.mq135Aqi,
                 thresholds.temperatureC, thresholds.humidityPercent);
   return true;
 }

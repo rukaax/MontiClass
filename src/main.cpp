@@ -4,6 +4,7 @@
 #include <Arduino.h>
 
 #include "SSD1306.h"
+#include "buzzer.h"
 #include "control.h"
 #include "environment_status.h"
 #include "network_portal.h"
@@ -20,6 +21,7 @@ Screen screen = Screen::Monitor;
 uint8_t selectedThreshold = 0;
 bool editingThreshold = false;
 bool thresholdsDirty = false;
+bool settingsNetworkInfoVisible = false;
 
 // 设置页的编辑判断留在 main：这里决定“旋转”是在移动光标还是修改阈值；
 // 阈值的保存细节则封装在 threshold_store 模块中。
@@ -29,7 +31,7 @@ void adjustSelectedThreshold(int direction) {
       thresholds.lightPercent = constrain(thresholds.lightPercent + direction, 0.0f, 100.0f);
       break;
     case 1:
-      thresholds.mq135Ppm = constrain(thresholds.mq135Ppm + direction * 10.0f, 0.0f, 2000.0f);
+      thresholds.mq135Aqi = constrain(thresholds.mq135Aqi + direction * 5.0f, 0.0f, 500.0f);
       break;
     case 2:
       thresholds.temperatureC = constrain(thresholds.temperatureC + direction * 0.5f, 0.0f, 60.0f);
@@ -41,7 +43,7 @@ void adjustSelectedThreshold(int direction) {
   thresholdsDirty = true;
 }
 
-void updateSettings(int direction) {
+void updateSettings(int direction, bool stationConnected) {
   if (editingThreshold) {
     if (direction != 0) adjustSelectedThreshold(direction);
     if (controlWasShortPress()) {
@@ -51,22 +53,34 @@ void updateSettings(int direction) {
     return;
   }
 
-  if (direction > 0 && selectedThreshold > 0) --selectedThreshold;
-  if (direction < 0 && selectedThreshold < 3) ++selectedThreshold;
-  if (controlWasShortPress()) editingThreshold = true;
-  if (controlWasLongPress()) screen = Screen::Monitor;
+  if (!stationConnected) settingsNetworkInfoVisible = false;
+  if (direction > 0) {
+    if (settingsNetworkInfoVisible) settingsNetworkInfoVisible = false;
+    else if (selectedThreshold > 0) --selectedThreshold;
+  } else if (direction < 0) {
+    if (selectedThreshold < 3) ++selectedThreshold;
+    else if (stationConnected) settingsNetworkInfoVisible = true;
+  }
+  // IP 行是只读信息；显示它时短按不进入任何编辑状态。
+  if (controlWasShortPress() && !settingsNetworkInfoVisible) editingThreshold = true;
+  if (controlWasLongPress()) {
+    screen = Screen::Monitor;
+    settingsNetworkInfoVisible = false;
+  }
 }
 }  // namespace
 
 void setup() {
   Serial.begin(115200);
-  // ESP32-S3 原生 USB CDC 在开机瞬间可能尚未被电脑枚举，短暂等待可避免
-  // 丢失第一批启动日志；UART 模式下该循环会立刻通过。
+  // 项目使用开发板 USB-UART 桥接串口；与 ROM 启动日志保持同一端口。
+  // 短暂等待不会阻塞 UART，可给串口监视器留出复位后的连接时间。
   const uint32_t serialReadyDeadline = millis() + 1500;
   while (!Serial && millis() < serialReadyDeadline) delay(10);
   Serial.setDebugOutput(true);
   delay(100);
   Serial.println("\n[boot] Classroom ESP32 monitor");
+  // 低电平触发蜂鸣器必须尽早拉高，避免其在 Wi-Fi/OLED 初始化期间误响。
+  buzzerInit();
 
   thresholdStoreBegin(thresholds);
   oledInit();
@@ -82,14 +96,21 @@ void loop() {
   sensors.update();
   controlUpdate();
   networkPortal.update(sensors.data());
+  const EnvironmentStatus environmentStatus = evaluateEnvironment(sensors.data(), thresholds);
+  const uint8_t environmentAlertMask =
+      (environmentStatus.light1Alert ? 0x01 : 0x00) |
+      (environmentStatus.light2Alert ? 0x02 : 0x00) |
+      (environmentStatus.airAlert ? 0x04 : 0x00) |
+      (environmentStatus.temperatureAlert ? 0x08 : 0x00) |
+      (environmentStatus.humidityAlert ? 0x10 : 0x00);
+  buzzerUpdate(environmentAlertMask);
 
   // 无论配网前用户停在何种设置状态，联网成功后都回到实时监测页。
   if (networkPortal.takeConnectionSucceeded()) {
     screen = Screen::Monitor;
     editingThreshold = false;
+    settingsNetworkInfoVisible = false;
   }
-
-  networkPortal.handleProvisioningInput(controlWasShortPress());
 
   // 首次配网与连接过程由网络模块接管 OLED；连接成功后自动恢复监测页面。
   if (networkPortal.isShowingNetworkScreen()) {
@@ -105,12 +126,16 @@ void loop() {
       screen = Screen::Settings;
       selectedThreshold = 0;
       editingThreshold = false;
+      settingsNetworkInfoVisible = false;
     }
     // 超限规则独立在 environment_status.cpp，main 决定在监测页使用该判断结果。
-    drawMonitor(sensors.data(), evaluateEnvironment(sensors.data(), thresholds));
+    drawMonitor(sensors.data(), environmentStatus);
   } else {
-    updateSettings(direction);
-    drawSettings(thresholds, selectedThreshold, editingThreshold);
+    const bool stationConnected = networkPortal.isStationConnected();
+    updateSettings(direction, stationConnected);
+    const String ipAddress = networkPortal.stationIpAddress();
+    drawSettings(thresholds, selectedThreshold, editingThreshold,
+                 ipAddress.c_str(), settingsNetworkInfoVisible);
   }
 
   controlDebugPrint();

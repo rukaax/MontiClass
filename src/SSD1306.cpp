@@ -70,8 +70,7 @@ void drawProvisioningScreen(const char* ssid, const char* qrPayload) {
   u8g2_DrawStr(&oled, 62, 40, ssid);
   u8g2_SetFont(&oled, u8g2_font_wqy12_t_gb2312);
   u8g2_DrawUTF8(&oled, 62, 52, "无密码");
-  // 配网页只有一个本地操作，光标始终指向它；短按 EC11 即确认离线监测。
-  u8g2_DrawUTF8(&oled, 62, 63, ">暂不连接");
+  u8g2_DrawUTF8(&oled, 62, 63, "热点持续开放");
   u8g2_SendBuffer(&oled);
 }
 
@@ -97,13 +96,14 @@ void drawMonitor(const SensorData& data, const EnvironmentStatus& status) {
   u8g2_DrawUTF8(&oled, 2, 12, "环境质量看板");
   u8g2_SetDrawColor(&oled, 1);
 
-  snprintf(line, sizeof(line), "光照: %3.0f%%", data.lightPercent);
+  snprintf(line, sizeof(line), "光1:%2.0f%% 光2:%2.0f%%",
+           data.light1Percent, data.light2Percent);
   u8g2_DrawUTF8(&oled, 2, 26, line);
   drawAlertMark(26, status.lightAlert);
 
-  // 预热期间展示 raw ADC 而非不可信的 ppm；这样也能验证 MQ135 AO 接线。
+  // 预热期间展示 raw ADC；基线建立后显示 0..500 相对 AQI。
   if (data.mq135WarmedUp) {
-    snprintf(line, sizeof(line), "空气: %4.0fppm", data.mq135PpmEstimate);
+    snprintf(line, sizeof(line), "空气AQI: %3.0f", data.mq135AqiEstimate);
   } else {
     snprintf(line, sizeof(line), "空气:预热 %4u", data.mq135Raw);
   }
@@ -124,28 +124,44 @@ void drawMonitor(const SensorData& data, const EnvironmentStatus& status) {
   u8g2_SendBuffer(&oled);
 }
 
-void drawSettings(const Thresholds& thresholds, uint8_t selectedIndex, bool editing) {
+void drawSettings(const Thresholds& thresholds, uint8_t selectedIndex, bool editing,
+                  const char* ipAddress, bool showNetworkInfo) {
   // 这里使用局部快照数组，仅用于把结构体按固定菜单顺序渲染；修改操作
   // 仍由 main.cpp 统一完成，避免显示层拥有业务状态。
-  const char* labels[] = {"光照", "空气", "温度", "湿度"};
-  const float values[] = {thresholds.lightPercent, thresholds.mq135Ppm,
+  const char* labels[] = {"光照下限", "空气", "温度", "湿度"};
+  const float values[] = {thresholds.lightPercent, thresholds.mq135Aqi,
                           thresholds.temperatureC, thresholds.humidityPercent};
-  const char* units[] = {"%", "ppm", "C", "%"};
+  const char* units[] = {"%", "AQI", "C", "%"};
   char line[28];
 
   u8g2_ClearBuffer(&oled);
   u8g2_SetFont(&oled, u8g2_font_wqy12_t_gb2312);
   u8g2_DrawBox(&oled, 0, 0, 128, 14);
   u8g2_SetDrawColor(&oled, 0);
-  u8g2_DrawUTF8(&oled, 2, 12, editing ? "调节阈值  短按确认" : "选择项目  短按调节");
+  const char* title = showNetworkInfo ? "网络信息  向上返回" :
+                      (editing ? "调节阈值  短按确认" : "选择项目  短按调节");
+  u8g2_DrawUTF8(&oled, 2, 12, title);
   u8g2_SetDrawColor(&oled, 1);
 
-  for (uint8_t i = 0; i < 4; ++i) {
+  const uint8_t firstThreshold = showNetworkInfo ? 1 : 0;
+  for (uint8_t row = 0; row < 4; ++row) {
     // 基线从 26 到 62，每行相隔 12 像素，与 wqy12 字体高度匹配。
-    const uint8_t y = 26 + i * 12;
-    if (i == 2) snprintf(line, sizeof(line), "%s: %4.1f%s", labels[i], values[i], units[i]);
-    else snprintf(line, sizeof(line), "%s: %4.0f%s", labels[i], values[i], units[i]);
-    if (i == selectedIndex) {
+    const uint8_t y = 26 + row * 12;
+    const uint8_t thresholdIndex = firstThreshold + row;
+    if (thresholdIndex >= 4) {
+      // IP 行没有边框、没有反白，也不能进入编辑。
+      snprintf(line, sizeof(line), "IP:%s", ipAddress);
+      u8g2_DrawStr(&oled, 3, y, line);
+      continue;
+    }
+    if (thresholdIndex == 2) {
+      snprintf(line, sizeof(line), "%s: %4.1f%s", labels[thresholdIndex],
+               values[thresholdIndex], units[thresholdIndex]);
+    } else {
+      snprintf(line, sizeof(line), "%s: %4.0f%s", labels[thresholdIndex],
+               values[thresholdIndex], units[thresholdIndex]);
+    }
+    if (thresholdIndex == selectedIndex) {
       if (editing) {
         // 实心反白代表“旋转会立即改数值”；边框仅代表当前光标位置。
         u8g2_DrawBox(&oled, 0, y - 10, 128, 12);

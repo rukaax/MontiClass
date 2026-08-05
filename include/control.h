@@ -14,6 +14,7 @@ void controlInit();                  // 配置引脚并注册 CLK 上升沿中�
 void controlUpdate();                // 主循环每轮调用，处理 SW 消抖与按压事件。
 int controlReadEncoderDelta();       // 取走并清零 ISR 累计的旋转方向。
 bool controlWasShortPress();
+// 持续按下达到阈值时立即产生一次事件，不需要等到松手。
 bool controlWasLongPress();
 // 以 115200 串口输出 EC11 原始电平、正交跳变统计和按键状态；
 // 内部已限速，主循环可每轮调用而不会刷屏。

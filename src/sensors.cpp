@@ -7,31 +7,68 @@ namespace {
 // 多次读取取平均可抑制 ADC 和模块比较器附近的瞬时噪声。该函数没有
 // delay，因此不会明显阻塞界面刷新。
 constexpr uint8_t kAdcSamples = 8;
-// 原工程接法中，光敏 AO 的 ADC 值在变暗时增大。
-constexpr bool kLightDarkIsHigh = true;
-// 仅供 UI 显示和阈值比较的线性刻度。MQ135 的真实 ppm 与温湿度、
-// 负载电阻和基线阻值有关，不能用这个常数替代正式标定。
-constexpr float kMq135DisplayRangePpm = 2000.0f;
+// 当前两只光敏模块按同一类型处理：AO 的 ADC 值在变暗时增大。若某一路
+// 模块方向相反，只需修改对应常量。
+constexpr bool kLight1DarkIsHigh = true;
+constexpr bool kLight2DarkIsHigh = true;
+
+struct AqiPoint {
+  float rawRatio;
+  float aqi;
+};
+
+// 相对空气指数曲线：本次开机基线对应 50，AO 相对基线升高时指数上升。
+// 这是用于趋势和告警的 MQ135 估算值，不是由污染物浓度计算的标准 AQI。
+constexpr AqiPoint kRelativeAqiCurve[] = {
+    {0.0f, 0.0f}, {1.0f, 50.0f}, {1.25f, 100.0f}, {1.5f, 150.0f},
+    {2.0f, 200.0f}, {3.0f, 300.0f}, {4.0f, 400.0f}, {5.0f, 500.0f},
+};
+
+float lightPercentFromRaw(uint16_t raw, bool darkIsHigh) {
+  const float adcPercent = raw * 100.0f / 4095.0f;
+  return darkIsHigh ? 100.0f - adcPercent : adcPercent;
+}
+
+float relativeAqiFromRaw(uint16_t raw, uint16_t baselineRaw) {
+  if (baselineRaw == 0) return NAN;
+  const float ratio = static_cast<float>(raw) / baselineRaw;
+  for (size_t i = 1; i < sizeof(kRelativeAqiCurve) / sizeof(kRelativeAqiCurve[0]); ++i) {
+    const AqiPoint& lower = kRelativeAqiCurve[i - 1];
+    const AqiPoint& upper = kRelativeAqiCurve[i];
+    if (ratio <= upper.rawRatio) {
+      const float position = (ratio - lower.rawRatio) / (upper.rawRatio - lower.rawRatio);
+      return constrain(lower.aqi + position * (upper.aqi - lower.aqi), 0.0f, 500.0f);
+    }
+  }
+  return 500.0f;
+}
 }
 
 void SensorManager::begin() {
-  // ESP32-S3 ADC 设为 12 位，对应 kAdcMax=4095。11 dB 衰减覆盖较宽
+  // ESP32-S3 ADC 设为 12 位，对应 0..4095。11 dB 衰减覆盖较宽
   // 的输入范围；无论如何，GPIO 上的电压都绝不能超过 3.3V。
   analogReadResolution(12);
-  analogSetPinAttenuation(Pins::kLight, ADC_11db);
+  analogSetPinAttenuation(Pins::kLight1, ADC_11db);
+  analogSetPinAttenuation(Pins::kLight2, ADC_11db);
   analogSetPinAttenuation(Pins::kMq135, ADC_11db);
-  pinMode(Pins::kLight, INPUT);
+  pinMode(Pins::kLight1, INPUT);
+  pinMode(Pins::kLight2, INPUT);
   pinMode(Pins::kMq135, INPUT);
+  pinMode(Pins::kLd2402, INPUT_PULLDOWN);
   // DHT 库自行完成 DATA 时序；这里只配置并记录 MQ135 预热起点。
   dht_.begin();
   mq135StartedMs_ = millis();
+  mq135BaselineSum_ = 0;
+  mq135BaselineSamples_ = 0;
 
-  Serial.println("[sensor] initialized: light=GPIO7 MQ135=GPIO15 DHT11=GPIO16");
-  Serial.println("[sensor] MQ135 is warming up; raw ADC is still reported for wiring checks.");
+  Serial.println("[sensor] initialized: light1=GPIO7 light2=GPIO6 MQ135=GPIO15 DHT11=GPIO16 LD2402=GPIO10");
+  Serial.println("[sensor] MQ135 warming up for 180s; raw ADC/mV remain available for checks.");
 }
 
 bool SensorManager::update() {
   const uint32_t now = millis();
+  // 人体存在信号每轮读取，不受两秒模拟量采样周期限制，保证 UI 响应及时。
+  data_.presenceDetected = digitalRead(Pins::kLd2402) == HIGH;
   // DHT11 的推荐最短采样间隔约为 1 秒，这里使用 2 秒；sampledOnce_
   // 保证首次启动立即采样，而不是等待第一个完整周期。
   if (sampledOnce_ && now - lastSampleMs_ < kSampleIntervalMs) return false;
@@ -39,15 +76,33 @@ bool SensorManager::update() {
   lastSampleMs_ = now;
 
   // 始终保留原始 ADC 值，现场可据此快速判断 AO 是否接错或悬空。
-  data_.lightRaw = readAveragedAdc(Pins::kLight);
+  data_.light1Raw = readAveragedAdc(Pins::kLight1);
+  data_.light2Raw = readAveragedAdc(Pins::kLight2);
   data_.mq135Raw = readAveragedAdc(Pins::kMq135);
+  data_.mq135MilliVolts = readAveragedMillivolts(Pins::kMq135);
 
-  // 光敏百分比是相对亮度而非 lux；若你的模块亮暗方向相反，修改
-  // kLightDarkIsHigh 即可，不需要动 UI 和阈值代码。
-  const float lightAdcPercent = data_.lightRaw * 100.0f / kAdcMax;
-  data_.lightPercent = kLightDarkIsHigh ? 100.0f - lightAdcPercent : lightAdcPercent;
-  data_.mq135PpmEstimate = data_.mq135Raw * kMq135DisplayRangePpm / kAdcMax;
-  data_.mq135WarmedUp = now - mq135StartedMs_ >= kMq135WarmupMs;
+  // 光敏百分比是相对亮度而非 lux。MQ135 在预热最后 60 秒采集本次
+  // 开机基线，之后把 AO 相对基线的变化映射为 0..500 相对 AQI。
+  data_.light1Percent = lightPercentFromRaw(data_.light1Raw, kLight1DarkIsHigh);
+  data_.light2Percent = lightPercentFromRaw(data_.light2Raw, kLight2DarkIsHigh);
+  const uint32_t mqElapsedMs = now - mq135StartedMs_;
+  if (mqElapsedMs >= kMq135WarmupMs - kMq135BaselineWindowMs &&
+      mqElapsedMs < kMq135WarmupMs) {
+    mq135BaselineSum_ += data_.mq135Raw;
+    ++mq135BaselineSamples_;
+  }
+  const bool wasWarmedUp = data_.mq135WarmedUp;
+  data_.mq135WarmedUp = mqElapsedMs >= kMq135WarmupMs;
+  if (data_.mq135WarmedUp && !wasWarmedUp) {
+    data_.mq135BaselineRaw = mq135BaselineSamples_ == 0
+                                 ? data_.mq135Raw
+                                 : static_cast<uint16_t>(mq135BaselineSum_ / mq135BaselineSamples_);
+    Serial.printf("[MQ135] baseline established: raw=%u samples=%u relativeAQI=50\r\n",
+                  data_.mq135BaselineRaw, mq135BaselineSamples_);
+  }
+  if (data_.mq135WarmedUp) {
+    data_.mq135AqiEstimate = relativeAqiFromRaw(data_.mq135Raw, data_.mq135BaselineRaw);
+  }
 
   // DHT11 失败时不覆盖上一次有效温湿度，但 dhtValid 仍会变为 false，
   // 因而 OLED 显示 "--" 而不是把旧数据伪装成最新读数。
@@ -72,23 +127,39 @@ uint16_t SensorManager::readAveragedAdc(uint8_t pin) {
   return static_cast<uint16_t>(sum / kAdcSamples);
 }
 
+uint16_t SensorManager::readAveragedMillivolts(uint8_t pin) {
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < kAdcSamples; ++i) sum += analogReadMilliVolts(pin);
+  return static_cast<uint16_t>(sum / kAdcSamples);
+}
+
 void SensorManager::printSample() const {
-  // 日志故意同时输出原始值和换算值：换算异常时可先判断是接线/ADC 问题
-  // 还是上层的比例和阈值配置问题。
-  // 每个分支只调用一次 printf 并包含换行，串口监视器将始终按完整行显示。
-  // 使用栈上字符数组而非 Arduino String，避免长期输出日志产生堆碎片。
-  char mqValue[12] = "warmup";
+  // 每 2 秒为每只传感器输出一条独立日志，现场验线时无需从合并字段中找值。
+  Serial.printf("[LIGHT1] gpio=%u raw=%u brightness=%.0f%%\r\n",
+                Pins::kLight1, data_.light1Raw, data_.light1Percent);
+  Serial.printf("[LIGHT2] gpio=%u raw=%u brightness=%.0f%%\r\n",
+                Pins::kLight2, data_.light2Raw, data_.light2Percent);
+  Serial.printf("[LD2402] gpio=%u level=%u presence=%s\r\n",
+                Pins::kLd2402, data_.presenceDetected ? 1 : 0,
+                data_.presenceDetected ? "detected" : "clear");
+
   if (data_.mq135WarmedUp) {
-    snprintf(mqValue, sizeof(mqValue), "%.0fppm", data_.mq135PpmEstimate);
-  }
-  if (data_.dhtValid) {
-    Serial.printf("[SENSOR] L=%u/%.0f%% MQ=%u/%s DHT=%.1fC/%.1f%%\n",
-                  data_.lightRaw, data_.lightPercent, data_.mq135Raw,
-                  mqValue,
-                  data_.temperatureC, data_.humidityPercent);
+    Serial.printf("[MQ135] gpio=%u raw=%u baseline=%u pinVoltage=%umV aqi=%.0f state=estimated\r\n",
+                  Pins::kMq135, data_.mq135Raw, data_.mq135BaselineRaw,
+                  data_.mq135MilliVolts, data_.mq135AqiEstimate);
   } else {
-    Serial.printf("[SENSOR] L=%u/%.0f%% MQ=%u/%s DHT=ERROR\n",
-                  data_.lightRaw, data_.lightPercent, data_.mq135Raw,
-                  mqValue);
+    const uint32_t elapsedMs = millis() - mq135StartedMs_;
+    const uint32_t remainingSeconds =
+        elapsedMs >= kMq135WarmupMs ? 0 : (kMq135WarmupMs - elapsedMs + 999) / 1000;
+    Serial.printf("[MQ135] gpio=%u raw=%u pinVoltage=%umV state=warmup remaining=%lus\r\n",
+                  Pins::kMq135, data_.mq135Raw, data_.mq135MilliVolts,
+                  static_cast<unsigned long>(remainingSeconds));
+  }
+
+  if (data_.dhtValid) {
+    Serial.printf("[DHT11] gpio=%u temperature=%.1fC humidity=%.1f%% state=ok\r\n",
+                  Pins::kDht11, data_.temperatureC, data_.humidityPercent);
+  } else {
+    Serial.printf("[DHT11] gpio=%u state=read_error check=VCC/GND/DATA\r\n", Pins::kDht11);
   }
 }

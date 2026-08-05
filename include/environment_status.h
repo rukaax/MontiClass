@@ -7,6 +7,9 @@
 #include "thresholds.h"
 
 struct EnvironmentStatus {
+  // 两路光敏共用下限阈值；任意一路低于阈值即提示。
+  bool light1Alert = false;
+  bool light2Alert = false;
   bool lightAlert = false;
   bool airAlert = false;
   bool temperatureAlert = false;

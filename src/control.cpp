@@ -14,7 +14,7 @@ namespace {
 constexpr uint32_t kEdgeDebounceUs = 150;
 constexpr uint32_t kDetentGuardUs = 4000;
 constexpr uint32_t kButtonDebounceMs = 35;
-constexpr uint32_t kLongPressMs = 800;
+constexpr uint32_t kLongPressMs = 500;
 constexpr uint32_t kDebugPeriodicMs = 1000;
 
 // 中断与主循环共享的数据。所有读取统计值的地方都要进入临界区。
@@ -35,6 +35,7 @@ uint32_t rawButtonChangedMs = 0;
 uint32_t buttonPressedMs = 0;
 bool shortPress = false;
 bool longPress = false;
+bool longPressFired = false;
 
 // 用 (旧状态 << 2) | 新状态查表。表中 1/-1 代表一个四分之一相位；
 // 对角跳变（例如 00 直接到 11）在正常旋转中不可能发生，记为 0。
@@ -102,7 +103,7 @@ void controlInit() {
   attachInterrupt(digitalPinToInterrupt(Pins::kEncoderClk), onEncoderEdge, CHANGE);
   attachInterrupt(digitalPinToInterrupt(Pins::kEncoderDt), onEncoderEdge, CHANGE);
 
-  Serial.printf("[EC11] initialized CLK=%d DT=%d SW=%d, initial state=%u\n",
+  Serial.printf("[EC11] initialized CLK=%d DT=%d SW=%d, initial state=%u\r\n",
                 Pins::kEncoderClk, Pins::kEncoderDt, Pins::kEncoderSw, lastEncoderState);
 }
 
@@ -119,14 +120,21 @@ void controlUpdate() {
   }
 
   // 电平稳定超过消抖时间后才认可为真正的按下/松开。
-  if (rawButtonDown == stableButtonDown || now - rawButtonChangedMs < kButtonDebounceMs) return;
-  stableButtonDown = rawButtonDown;
-  if (stableButtonDown) {
-    buttonPressedMs = now;
-  } else if (now - buttonPressedMs >= kLongPressMs) {
+  if (rawButtonDown != stableButtonDown && now - rawButtonChangedMs >= kButtonDebounceMs) {
+    stableButtonDown = rawButtonDown;
+    if (stableButtonDown) {
+      buttonPressedMs = now;
+      longPressFired = false;
+    } else if (!longPressFired) {
+      // 松开前没有触发长按，才把它识别为一次短按。
+      shortPress = true;
+    }
+  }
+
+  // 按住达到阈值就立即触发，只触发一次；松手不会再补发短按或长按。
+  if (stableButtonDown && !longPressFired && now - buttonPressedMs >= kLongPressMs) {
     longPress = true;
-  } else {
-    shortPress = true;
+    longPressFired = true;
   }
 }
 
@@ -175,7 +183,7 @@ void controlDebugPrint() {
   // 两者不一致时通常意味着旋钮正在转动或发生了触点抖动。
   // 保持在约 90 个字符内，常见串口终端不会因为窗口宽度自动折成两行。
   // 单次 printf 自带换行，也不会与传感器日志发生半行交错。
-  Serial.printf("[EC11] c=%d d=%d sw=%d st=%u q=%d pos=%ld v=%lu i=%lu f=%lu btn=%d/%d%s%s\n",
+  Serial.printf("[EC11] c=%d d=%d sw=%d st=%u q=%d pos=%ld v=%lu i=%lu f=%lu btn=%d/%d%s%s\r\n",
                 digitalRead(Pins::kEncoderClk), digitalRead(Pins::kEncoderDt),
                 digitalRead(Pins::kEncoderSw), state, quarters, static_cast<long>(total),
                 static_cast<unsigned long>(valid), static_cast<unsigned long>(invalid),

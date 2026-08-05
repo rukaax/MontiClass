@@ -125,7 +125,8 @@ void drawMonitor(const SensorData& data, const EnvironmentStatus& status) {
 }
 
 void drawSettings(const Thresholds& thresholds, uint8_t selectedIndex, bool editing,
-                  const char* ipAddress, bool showNetworkInfo) {
+                  const char* ipAddress, bool stationConnected,
+                  const ReportUploadStatus& reportStatus, bool showNetworkInfo) {
   // 这里使用局部快照数组，仅用于把结构体按固定菜单顺序渲染；修改操作
   // 仍由 main.cpp 统一完成，避免显示层拥有业务状态。
   const char* labels[] = {"光照下限", "空气", "温度", "湿度"};
@@ -143,17 +144,53 @@ void drawSettings(const Thresholds& thresholds, uint8_t selectedIndex, bool edit
   u8g2_DrawUTF8(&oled, 2, 12, title);
   u8g2_SetDrawColor(&oled, 1);
 
-  const uint8_t firstThreshold = showNetworkInfo ? 1 : 0;
+  if (showNetworkInfo) {
+    char elapsed[16];
+    const auto formatElapsed = [](bool available, uint32_t timestamp, char* output,
+                                  size_t outputSize) {
+      if (!available) {
+        snprintf(output, outputSize, "无记录");
+        return;
+      }
+      const uint32_t seconds = (millis() - timestamp) / 1000;
+      if (seconds < 5) snprintf(output, outputSize, "刚刚");
+      else if (seconds < 60) snprintf(output, outputSize, "%lu秒前",
+                                     static_cast<unsigned long>(seconds));
+      else if (seconds < 3600) snprintf(output, outputSize, "%lu分前",
+                                       static_cast<unsigned long>(seconds / 60));
+      else snprintf(output, outputSize, "%lu时前",
+                    static_cast<unsigned long>(seconds / 3600));
+    };
+
+    u8g2_SetFont(&oled, u8g2_font_wqy12_t_gb2312);
+    snprintf(line, sizeof(line), "IP: %s", stationConnected ? ipAddress : "未连接");
+    u8g2_DrawUTF8(&oled, 3, 26, line);
+
+    formatElapsed(reportStatus.hasDataUpload, reportStatus.lastDataUploadMs,
+                  elapsed, sizeof(elapsed));
+    snprintf(line, sizeof(line), "数据上报: %s", elapsed);
+    u8g2_DrawUTF8(&oled, 3, 38, line);
+
+    formatElapsed(reportStatus.hasHeartbeatUpload, reportStatus.lastHeartbeatUploadMs,
+                  elapsed, sizeof(elapsed));
+    snprintf(line, sizeof(line), "心跳上报: %s", elapsed);
+    u8g2_DrawUTF8(&oled, 3, 50, line);
+
+    const char* apiText = "待检测";
+    if (reportStatus.apiConnectivity == ApiConnectivity::NotConfigured) apiText = "未配置";
+    else if (!stationConnected ||
+             reportStatus.apiConnectivity == ApiConnectivity::Unreachable) apiText = "不通";
+    else if (reportStatus.apiConnectivity == ApiConnectivity::Reachable) apiText = "连通";
+    snprintf(line, sizeof(line), "API: %s", apiText);
+    u8g2_DrawUTF8(&oled, 3, 62, line);
+    u8g2_SendBuffer(&oled);
+    return;
+  }
+
   for (uint8_t row = 0; row < 4; ++row) {
     // 基线从 26 到 62，每行相隔 12 像素，与 wqy12 字体高度匹配。
     const uint8_t y = 26 + row * 12;
-    const uint8_t thresholdIndex = firstThreshold + row;
-    if (thresholdIndex >= 4) {
-      // IP 行没有边框、没有反白，也不能进入编辑。
-      snprintf(line, sizeof(line), "IP:%s", ipAddress);
-      u8g2_DrawStr(&oled, 3, y, line);
-      continue;
-    }
+    const uint8_t thresholdIndex = row;
     if (thresholdIndex == 2) {
       snprintf(line, sizeof(line), "%s: %4.1f%s", labels[thresholdIndex],
                values[thresholdIndex], units[thresholdIndex]);

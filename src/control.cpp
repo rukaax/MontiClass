@@ -1,6 +1,6 @@
 /**
  * @file control.cpp
- * @brief EC11 正交解码、按键消抖和串口诊断。
+ * @brief EC11 正交解码和按键消抖。
  *
  * EC11 的 A/B（本项目为 CLK/DT）是相位相差 90° 的方波。仅观察 CLK
  * 上升沿无法分辨触点反弹，容易把一次旋转识别成多步；因此这里记录完整
@@ -15,7 +15,6 @@ constexpr uint32_t kEdgeDebounceUs = 150;
 constexpr uint32_t kDetentGuardUs = 4000;
 constexpr uint32_t kButtonDebounceMs = 35;
 constexpr uint32_t kLongPressMs = 500;
-constexpr uint32_t kDebugPeriodicMs = 1000;
 
 // 中断与主循环共享的数据。所有读取统计值的地方都要进入临界区。
 volatile int16_t encoderDelta = 0;       // 已完成、尚未交给 UI 的卡点数
@@ -103,8 +102,6 @@ void controlInit() {
   attachInterrupt(digitalPinToInterrupt(Pins::kEncoderClk), onEncoderEdge, CHANGE);
   attachInterrupt(digitalPinToInterrupt(Pins::kEncoderDt), onEncoderEdge, CHANGE);
 
-  Serial.printf("[EC11] initialized CLK=%d DT=%d SW=%d, initial state=%u\r\n",
-                Pins::kEncoderClk, Pins::kEncoderDt, Pins::kEncoderSw, lastEncoderState);
 }
 
 void controlUpdate() {
@@ -149,50 +146,3 @@ int controlReadEncoderDelta() {
 
 bool controlWasShortPress() { return shortPress; }
 bool controlWasLongPress() { return longPress; }
-
-void controlDebugPrint() {
-  // 串口输出在主循环执行。ISR 中打印会阻塞中断并让抖动问题更严重。
-  static uint32_t lastPrintMs = 0;
-  static uint32_t lastValidTransitions = 0;
-  static uint32_t lastInvalidTransitions = 0;
-  static uint32_t lastFilteredEdges = 0;
-  static int32_t lastTotalDetents = 0;
-
-  uint8_t state;
-  int8_t quarters;
-  uint32_t valid;
-  uint32_t invalid;
-  uint32_t filtered;
-  int32_t total;
-  noInterrupts();
-  state = lastEncoderState;
-  quarters = quarterSteps;
-  valid = validTransitions;
-  invalid = invalidTransitions;
-  filtered = filteredEdges;
-  total = totalDetents;
-  interrupts();
-
-  const uint32_t now = millis();
-  const bool changed = valid != lastValidTransitions || invalid != lastInvalidTransitions ||
-                       filtered != lastFilteredEdges || total != lastTotalDetents ||
-                       shortPress || longPress;
-  if (!changed && now - lastPrintMs < kDebugPeriodicMs) return;
-
-  // state 是 ISR 最近读到的状态；CLK/DT/SW 则是此刻真实引脚电平，
-  // 两者不一致时通常意味着旋钮正在转动或发生了触点抖动。
-  // 保持在约 90 个字符内，常见串口终端不会因为窗口宽度自动折成两行。
-  // 单次 printf 自带换行，也不会与传感器日志发生半行交错。
-  Serial.printf("[EC11] c=%d d=%d sw=%d st=%u q=%d pos=%ld v=%lu i=%lu f=%lu btn=%d/%d%s%s\r\n",
-                digitalRead(Pins::kEncoderClk), digitalRead(Pins::kEncoderDt),
-                digitalRead(Pins::kEncoderSw), state, quarters, static_cast<long>(total),
-                static_cast<unsigned long>(valid), static_cast<unsigned long>(invalid),
-                static_cast<unsigned long>(filtered), rawButtonDown, stableButtonDown,
-                shortPress ? " short" : "", longPress ? " long" : "");
-
-  lastPrintMs = now;
-  lastValidTransitions = valid;
-  lastInvalidTransitions = invalid;
-  lastFilteredEdges = filtered;
-  lastTotalDetents = total;
-}

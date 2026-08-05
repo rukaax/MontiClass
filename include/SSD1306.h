@@ -6,6 +6,7 @@
 #include <Wire.h>
 
 #include "environment_status.h"
+#include "report_uploader.h"
 #include "sensors.h"
 #include "thresholds.h"
 
@@ -24,6 +25,7 @@ void drawProvisioningScreen(const char* ssid, const char* qrPayload);
 void drawNetworkConnectingScreen(const char* ssid);
 // 监测页同时显示两路光照、相对 AQI、温度和湿度。
 void drawMonitor(const SensorData& data, const EnvironmentStatus& status);
-// IP 是滚动到阈值列表下方的只读行，不参与 selectedIndex 选择。
+// 网络信息是阈值列表下方的只读页面，不参与 selectedIndex 选择。
 void drawSettings(const Thresholds& thresholds, uint8_t selectedIndex, bool editing,
-                  const char* ipAddress, bool showNetworkInfo);
+                  const char* ipAddress, bool stationConnected,
+                  const ReportUploadStatus& reportStatus, bool showNetworkInfo);

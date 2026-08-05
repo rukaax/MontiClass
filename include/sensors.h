@@ -60,5 +60,4 @@ class SensorManager {
 
   static uint16_t readAveragedAdc(uint8_t pin);
   static uint16_t readAveragedMillivolts(uint8_t pin);
-  void printSample() const;
 };

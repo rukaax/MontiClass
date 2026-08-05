@@ -2,13 +2,17 @@
  * @brief 程序入口：读取传感器、处理交互判断，并调度各功能模块。
  */
 #include <Arduino.h>
+#include <esp_log.h>
 
 #include "SSD1306.h"
 #include "buzzer.h"
 #include "control.h"
 #include "environment_status.h"
+#include "fan.h"
 #include "network_portal.h"
+#include "rtc_clock.h"
 #include "sensors.h"
+#include "servo.h"
 #include "threshold_store.h"
 
 namespace {
@@ -43,7 +47,7 @@ void adjustSelectedThreshold(int direction) {
   thresholdsDirty = true;
 }
 
-void updateSettings(int direction, bool stationConnected) {
+void updateSettings(int direction) {
   if (editingThreshold) {
     if (direction != 0) adjustSelectedThreshold(direction);
     if (controlWasShortPress()) {
@@ -53,15 +57,14 @@ void updateSettings(int direction, bool stationConnected) {
     return;
   }
 
-  if (!stationConnected) settingsNetworkInfoVisible = false;
   if (direction > 0) {
     if (settingsNetworkInfoVisible) settingsNetworkInfoVisible = false;
     else if (selectedThreshold > 0) --selectedThreshold;
   } else if (direction < 0) {
     if (selectedThreshold < 3) ++selectedThreshold;
-    else if (stationConnected) settingsNetworkInfoVisible = true;
+    else settingsNetworkInfoVisible = true;
   }
-  // IP 行是只读信息；显示它时短按不进入任何编辑状态。
+  // 网络信息页只读；显示它时短按不进入任何编辑状态。
   if (controlWasShortPress() && !settingsNetworkInfoVisible) editingThreshold = true;
   if (controlWasLongPress()) {
     screen = Screen::Monitor;
@@ -77,14 +80,22 @@ void setup() {
   const uint32_t serialReadyDeadline = millis() + 1500;
   while (!Serial && millis() < serialReadyDeadline) delay(10);
   Serial.setDebugOutput(true);
+  esp_log_level_set("*", ESP_LOG_INFO);
   delay(100);
   Serial.println("\n[boot] Classroom ESP32 monitor");
+  Serial.printf("[MEM] flash=%uMB psram=%s psram_size=%uMB\r\n",
+                static_cast<unsigned int>(ESP.getFlashChipSize() / (1024 * 1024)),
+                psramFound() ? "yes" : "no",
+                static_cast<unsigned int>(ESP.getPsramSize() / (1024 * 1024)));
   // 低电平触发蜂鸣器必须尽早拉高，避免其在 Wi-Fi/OLED 初始化期间误响。
   buzzerInit();
 
   thresholdStoreBegin(thresholds);
   oledInit();
   drawBootScreen();
+  rtcClock.begin();
+  servoInit();
+  fanInit();
   networkPortal.begin();
   controlInit();
   sensors.begin();
@@ -104,6 +115,8 @@ void loop() {
       (environmentStatus.temperatureAlert ? 0x08 : 0x00) |
       (environmentStatus.humidityAlert ? 0x10 : 0x00);
   buzzerUpdate(environmentAlertMask);
+  servoUpdate(environmentStatus);
+  fanUpdate(environmentStatus);
 
   // 无论配网前用户停在何种设置状态，联网成功后都回到实时监测页。
   if (networkPortal.takeConnectionSucceeded()) {
@@ -114,7 +127,6 @@ void loop() {
 
   // 首次配网与连接过程由网络模块接管 OLED；连接成功后自动恢复监测页面。
   if (networkPortal.isShowingNetworkScreen()) {
-    controlDebugPrint();
     delay(15);
     return;
   }
@@ -132,12 +144,13 @@ void loop() {
     drawMonitor(sensors.data(), environmentStatus);
   } else {
     const bool stationConnected = networkPortal.isStationConnected();
-    updateSettings(direction, stationConnected);
+    updateSettings(direction);
     const String ipAddress = networkPortal.stationIpAddress();
+    const ReportUploadStatus reportStatus = networkPortal.reportUploadStatus();
     drawSettings(thresholds, selectedThreshold, editingThreshold,
-                 ipAddress.c_str(), settingsNetworkInfoVisible);
+                 ipAddress.c_str(), stationConnected, reportStatus,
+                 settingsNetworkInfoVisible);
   }
 
-  controlDebugPrint();
   delay(15);
 }

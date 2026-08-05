@@ -7,6 +7,7 @@
 #include <WebServer.h>
 
 #include "report_uploader.h"
+#include "rtc_clock.h"
 #include "sensors.h"
 
 class NetworkPortal {
@@ -22,6 +23,7 @@ class NetworkPortal {
   // 设置页只读网络信息；未连接时地址为空。
   bool isStationConnected() const;
   String stationIpAddress() const;
+  ReportUploadStatus reportUploadStatus() const;
 
  private:
   void configureRoutes();
@@ -31,6 +33,8 @@ class NetworkPortal {
   bool saveCredentials(const String& ssid, const String& password);
   void clearCredentials();
   void sendStatus();
+  void sendTime();
+  void receiveTime();
   void sendNetworks();
   bool startNetworkScan();
   void ensureProvisioningAp();

@@ -61,8 +61,6 @@ void SensorManager::begin() {
   mq135BaselineSum_ = 0;
   mq135BaselineSamples_ = 0;
 
-  Serial.println("[sensor] initialized: light1=GPIO7 light2=GPIO6 MQ135=GPIO15 DHT11=GPIO16 LD2402=GPIO10");
-  Serial.println("[sensor] MQ135 warming up for 180s; raw ADC/mV remain available for checks.");
 }
 
 bool SensorManager::update() {
@@ -97,8 +95,6 @@ bool SensorManager::update() {
     data_.mq135BaselineRaw = mq135BaselineSamples_ == 0
                                  ? data_.mq135Raw
                                  : static_cast<uint16_t>(mq135BaselineSum_ / mq135BaselineSamples_);
-    Serial.printf("[MQ135] baseline established: raw=%u samples=%u relativeAQI=50\r\n",
-                  data_.mq135BaselineRaw, mq135BaselineSamples_);
   }
   if (data_.mq135WarmedUp) {
     data_.mq135AqiEstimate = relativeAqiFromRaw(data_.mq135Raw, data_.mq135BaselineRaw);
@@ -114,7 +110,6 @@ bool SensorManager::update() {
     data_.humidityPercent = humidity;
   }
 
-  printSample();
   return true;
 }
 
@@ -131,35 +126,4 @@ uint16_t SensorManager::readAveragedMillivolts(uint8_t pin) {
   uint32_t sum = 0;
   for (uint8_t i = 0; i < kAdcSamples; ++i) sum += analogReadMilliVolts(pin);
   return static_cast<uint16_t>(sum / kAdcSamples);
-}
-
-void SensorManager::printSample() const {
-  // 每 2 秒为每只传感器输出一条独立日志，现场验线时无需从合并字段中找值。
-  Serial.printf("[LIGHT1] gpio=%u raw=%u brightness=%.0f%%\r\n",
-                Pins::kLight1, data_.light1Raw, data_.light1Percent);
-  Serial.printf("[LIGHT2] gpio=%u raw=%u brightness=%.0f%%\r\n",
-                Pins::kLight2, data_.light2Raw, data_.light2Percent);
-  Serial.printf("[LD2402] gpio=%u level=%u presence=%s\r\n",
-                Pins::kLd2402, data_.presenceDetected ? 1 : 0,
-                data_.presenceDetected ? "detected" : "clear");
-
-  if (data_.mq135WarmedUp) {
-    Serial.printf("[MQ135] gpio=%u raw=%u baseline=%u pinVoltage=%umV aqi=%.0f state=estimated\r\n",
-                  Pins::kMq135, data_.mq135Raw, data_.mq135BaselineRaw,
-                  data_.mq135MilliVolts, data_.mq135AqiEstimate);
-  } else {
-    const uint32_t elapsedMs = millis() - mq135StartedMs_;
-    const uint32_t remainingSeconds =
-        elapsedMs >= kMq135WarmupMs ? 0 : (kMq135WarmupMs - elapsedMs + 999) / 1000;
-    Serial.printf("[MQ135] gpio=%u raw=%u pinVoltage=%umV state=warmup remaining=%lus\r\n",
-                  Pins::kMq135, data_.mq135Raw, data_.mq135MilliVolts,
-                  static_cast<unsigned long>(remainingSeconds));
-  }
-
-  if (data_.dhtValid) {
-    Serial.printf("[DHT11] gpio=%u temperature=%.1fC humidity=%.1f%% state=ok\r\n",
-                  Pins::kDht11, data_.temperatureC, data_.humidityPercent);
-  } else {
-    Serial.printf("[DHT11] gpio=%u state=read_error check=VCC/GND/DATA\r\n", Pins::kDht11);
-  }
 }

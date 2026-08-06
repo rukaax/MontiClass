@@ -75,7 +75,7 @@ WebUI 的“数据上报”区域可配置 API Base URL（例如 `https://api.ex
 - 请求固定使用 `POST`、`Content-Type: application/json; charset=utf-8` 和 `Connection: close`；配置 Token 后增加 `Authorization: Bearer <设备Token>`。
 - API Base URL 决定实际连接的协议、主机和端口。支持 `http://` 和 `https://`，HTTPS 默认使用端口 443，并通过固件内置的受信任根 CA 包校验证书链和域名，不会降级为不安全连接。
 - HTTPS 上报前会在后台通过 SNTP 同步证书校验时间，同步期间 WebUI 和传感器继续运行，请求会暂缓而不会绕过校验；20 秒仍未取得时间时回调日志记录错误 `-13`，之后继续自动重试。
-- 固定上报两路光照百分比、两路 ADC 原始值和 LD2402 的 `presence`；MQ135 预热完成后才包含 `aqi`，DHT11 读数有效时才包含 `temperature`。
+- 固定上报两路光照百分比、两路 ADC 原始值和 LD2402 的 `presence`；MQ135 预热完成后才包含 `aqi`，DHT11 读数有效时才包含 `temperature` 和相对湿度 `humidity`（单位 `%`，范围 0–100）。
 - WebUI 的 IP 状态下方同步显示最近数据上报、最近心跳上报和 API 连通状态；未联网时 IP 显示“未连接”。
 - 串口用 `[REPORT]` 输出 HTTP 201、服务端 HTTP 错误或网络传输错误。WebUI 的 HTTP 2xx 成功回调最多保留最近 5 条且响应正文最多保留 64 字节；错误记录优先保留，最多使用 12 条总容量并保留最多 256 字节响应正文。
 

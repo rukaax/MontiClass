@@ -560,6 +560,10 @@ String ReportUploader::buildRequest(const SensorData& data, const String& host,
   if (data.dhtValid && !isnan(data.temperatureC)) {
     sensorFields += ",\"temperature\":" + String(data.temperatureC, 1);
   }
+  if (data.dhtValid && isfinite(data.humidityPercent) &&
+      data.humidityPercent >= 0.0f && data.humidityPercent <= 100.0f) {
+    sensorFields += ",\"humidity\":" + String(data.humidityPercent, 1);
+  }
   sensorFields += ",\"presence\":";
   sensorFields += data.presenceDetected ? "true" : "false";
 

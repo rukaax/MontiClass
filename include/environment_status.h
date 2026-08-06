@@ -14,6 +14,11 @@ struct EnvironmentStatus {
   bool airAlert = false;
   bool temperatureAlert = false;
   bool humidityAlert = false;
+  // 0..1 归一化超限程度：0 表示未超阈值，1 表示超出满量程区间。
+  // 读数无效或传感器未就绪时保持 0，执行器因此不会被脏数据带偏。
+  float airLoad = 0.0f;
+  float temperatureLoad = 0.0f;
+  float humidityLoad = 0.0f;
 };
 
 // 集中处理所有超限规则；显示模块只使用结果，不拥有业务判断。

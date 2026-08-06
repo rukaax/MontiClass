@@ -3,11 +3,17 @@
 #include <driver/mcpwm.h>
 
 namespace {
-constexpr mcpwm_unit_t kFanUnit = MCPWM_UNIT_0;
-constexpr mcpwm_timer_t kFanTimer = MCPWM_TIMER_1;
+// Keep the fan on the second MCPWM group so it cannot reconfigure the servo timer.
+constexpr mcpwm_unit_t kFanUnit = MCPWM_UNIT_1;
+constexpr mcpwm_timer_t kFanTimer = MCPWM_TIMER_0;
 constexpr mcpwm_generator_t kFanGeneratorA = MCPWM_GEN_A;
 constexpr mcpwm_generator_t kFanGeneratorB = MCPWM_GEN_B;
 constexpr uint32_t kFanFrequencyHz = 20000;
+// 直流风扇在低占空比下只会嗡嗡响而不转，所以一旦需要换气就至少给到起转档。
+constexpr uint8_t kMinRunSpeedPercent = 40;
+constexpr uint8_t kMaxSpeedPercent = 100;
+// 迟滞：降速比升速迟钝，避免读数在阈值附近抖动时风扇忽快忽慢。
+constexpr uint8_t kSpeedDeadbandPercent = 5;
 bool ready = false;
 bool manual = false;
 bool automaticNeedsApply = false;
@@ -36,11 +42,32 @@ void apply(int8_t nextDirection, uint8_t nextSpeed) {
   Serial.printf("[FAN] pwm direction=%d speed=%u%% dutyA=%.0f dutyB=%.0f\r\n",
                 direction, speed, reverseDuty, forwardDuty);
 }
+
+// AQI 与温湿度共同决定转速：取三者中最紧迫的一项作为主负荷，
+// 另外两项按较小权重叠加，这样"单项严重超标"和"三项同时轻微超标"都能提速。
+uint8_t blendSpeed(const EnvironmentStatus& status) {
+  const float loads[3] = {status.airLoad, status.temperatureLoad, status.humidityLoad};
+  float dominant = 0.0f;
+  float total = 0.0f;
+  uint8_t activeCount = 0;
+  for (const float load : loads) {
+    if (load > dominant) dominant = load;
+    total += load;
+    if (load > 0.0f) ++activeCount;
+  }
+  if (activeCount == 0) return 0;
+  // dominant 决定基础档位，其余负荷贡献剩余的一半，合计封顶在 1。
+  const float secondary = total - dominant;
+  float blended = dominant + secondary * 0.5f;
+  if (blended > 1.0f) blended = 1.0f;
+  const float range = static_cast<float>(kMaxSpeedPercent - kMinRunSpeedPercent);
+  return static_cast<uint8_t>(kMinRunSpeedPercent + blended * range + 0.5f);
+}
 }  // namespace
 
 void fanInit() {
-  const esp_err_t gpioA = mcpwm_gpio_init(kFanUnit, MCPWM1A, Pins::kFanIn1);
-  const esp_err_t gpioB = mcpwm_gpio_init(kFanUnit, MCPWM1B, Pins::kFanIn2);
+  const esp_err_t gpioA = mcpwm_gpio_init(kFanUnit, MCPWM0A, Pins::kFanIn1);
+  const esp_err_t gpioB = mcpwm_gpio_init(kFanUnit, MCPWM0B, Pins::kFanIn2);
   mcpwm_config_t config{};
   config.frequency = kFanFrequencyHz;
   config.cmpr_a = 0;
@@ -57,22 +84,25 @@ void fanInit() {
   }
   ready = true;
   apply(1, 0);
-  Serial.printf("[FAN] initialized L9110H IN1=%u IN2=%u pwm=%luHz auto=any-of-3\r\n",
-                Pins::kFanIn1, Pins::kFanIn2, static_cast<unsigned long>(kFanFrequencyHz));
+  Serial.printf("[FAN] initialized L9110H IN1=%u IN2=%u pwm=%luHz auto=blend(aqi,temp,humidity) speed=%u..%u%%\r\n",
+                Pins::kFanIn1, Pins::kFanIn2, static_cast<unsigned long>(kFanFrequencyHz),
+                kMinRunSpeedPercent, kMaxSpeedPercent);
 }
 
 void fanUpdate(const EnvironmentStatus& status) {
   if (!ready || manual) return;
-  const bool shouldRun = status.airAlert || status.temperatureAlert || status.humidityAlert;
-  const uint8_t desiredSpeed = shouldRun ? 100 : 0;
+  const uint8_t desiredSpeed = blendSpeed(status);
   const uint32_t now = millis();
   if (now - lastLogMs >= 2000) {
-    Serial.printf("[FAN] air=%u temp=%u humidity=%u target=%s dir=%d speed=%u%%\r\n",
-                  status.airAlert ? 1 : 0, status.temperatureAlert ? 1 : 0,
-                  status.humidityAlert ? 1 : 0, shouldRun ? "ON" : "OFF", direction, desiredSpeed);
+    Serial.printf("[FAN] load air=%.2f temp=%.2f humidity=%.2f target=%u%% dir=%d speed=%u%%\r\n",
+                  status.airLoad, status.temperatureLoad, status.humidityLoad, desiredSpeed,
+                  direction, speed);
     lastLogMs = now;
   }
-  if (automaticNeedsApply || desiredSpeed != speed) {
+  // 起停必须立刻响应；已在运转时只有变化超过死区才重写占空比。
+  const bool crossesStopBoundary = (desiredSpeed == 0) != (speed == 0);
+  const uint8_t delta = desiredSpeed > speed ? desiredSpeed - speed : speed - desiredSpeed;
+  if (automaticNeedsApply || crossesStopBoundary || delta >= kSpeedDeadbandPercent) {
     apply(direction, desiredSpeed);
     automaticNeedsApply = false;
   }

@@ -1,12 +1,17 @@
 /** @file buzzer.cpp */
 #include "buzzer.h"
 
+#include <Preferences.h>
+
 namespace {
 constexpr uint32_t kBuzzerOnMs = 50;
 constexpr uint16_t kBuzzerFrequencyHz = 2400;
+constexpr char kPreferencesNamespace[] = "buzzer_cfg";
+constexpr char kEnabledKey[] = "enabled";
 
 bool buzzerOn = false;
 bool toneStarted = false;
+bool enabled = true;
 uint8_t previousAlertMask = 0;
 uint32_t beepStartedMs = 0;
 
@@ -34,9 +39,17 @@ void buzzerInit() {
   digitalWrite(Pins::kBuzzer, HIGH);
   pinMode(Pins::kBuzzer, OUTPUT);
   buzzerOn = false;
-  Serial.printf("[BUZZER] initialized gpio=%u type=passive trigger=active-low frequency=%uHz beep=%lums\r\n",
+  Preferences preferences;
+  if (preferences.begin(kPreferencesNamespace, false)) {
+    enabled = preferences.getBool(kEnabledKey, true);
+    preferences.end();
+  } else {
+    enabled = true;
+    Serial.println("[BUZZER] ERROR: failed to open NVS; using enabled default");
+  }
+  Serial.printf("[BUZZER] initialized gpio=%u type=passive trigger=active-low frequency=%uHz beep=%lums enabled=%u\r\n",
                 Pins::kBuzzer, kBuzzerFrequencyHz,
-                static_cast<unsigned long>(kBuzzerOnMs));
+                static_cast<unsigned long>(kBuzzerOnMs), enabled ? 1 : 0);
 }
 
 void buzzerUpdate(uint8_t activeAlertMask) {
@@ -44,6 +57,11 @@ void buzzerUpdate(uint8_t activeAlertMask) {
   const uint8_t newlyActiveAlerts =
       activeAlertMask & static_cast<uint8_t>(~previousAlertMask);
   previousAlertMask = activeAlertMask;
+
+  if (!enabled) {
+    if (buzzerOn) setBuzzer(false);
+    return;
+  }
 
   if (newlyActiveAlerts != 0) {
     beepStartedMs = now;
@@ -56,4 +74,27 @@ void buzzerUpdate(uint8_t activeAlertMask) {
     setBuzzer(false);
     Serial.println("[BUZZER] one-shot beep completed");
   }
+}
+
+bool buzzerEnabled() { return enabled; }
+
+bool buzzerSetEnabled(bool nextEnabled) {
+  if (nextEnabled == enabled) return true;
+
+  Preferences preferences;
+  if (!preferences.begin(kPreferencesNamespace, false)) {
+    Serial.println("[BUZZER] ERROR: failed to open NVS while saving enabled state");
+    return false;
+  }
+  const bool saved = preferences.putBool(kEnabledKey, nextEnabled) == 1;
+  preferences.end();
+  if (!saved) {
+    Serial.println("[BUZZER] ERROR: failed to save enabled state");
+    return false;
+  }
+
+  enabled = nextEnabled;
+  if (!enabled) setBuzzer(false);
+  Serial.printf("[BUZZER] enabled=%u saved to NVS\r\n", enabled ? 1 : 0);
+  return true;
 }

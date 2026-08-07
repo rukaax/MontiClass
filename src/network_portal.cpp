@@ -9,7 +9,9 @@
 #include <math.h>
 
 #include "SSD1306.h"
+#include "buzzer.h"
 #include "fan.h"
+#include "lighting.h"
 #include "servo.h"
 
 namespace {
@@ -810,13 +812,45 @@ const char kActuatorPageV5[] PROGMEM = R"HTML(
     .fan-actions button.active {
       background: #0f766e;
     }
+    .light-row {
+      display: grid;
+      grid-template-columns: 110px minmax(0, 1fr) 48px;
+      gap: 10px;
+      align-items: center;
+      margin-top: 12px;
+    }
+    .light-row input {
+      margin: 0;
+    }
+    .light-row output {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .toggle-row input[type="checkbox"] {
+      width: 24px;
+      height: 24px;
+      margin: 0;
+      padding: 0;
+      accent-color: #0f766e;
+    }
     .status {
       min-height: 24px;
     }
     @media (max-width: 420px) {
       .number,
-      .fan-actions {
+      .fan-actions,
+      .light-row {
         grid-template-columns: 1fr;
+      }
+      .light-row output {
+        text-align: left;
       }
     }
   </style>
@@ -856,6 +890,35 @@ const char kActuatorPageV5[] PROGMEM = R"HTML(
       <button id="autoFan" class="auto" type="button">恢复自动控制</button>
       <p id="fanStatus" class="muted status"></p>
     </section>
+    <section class="card">
+      <h2>LED 灯光</h2>
+      <div class="readout"><span class="muted">控制模式</span><strong id="lightingCurrent">--</strong></div>
+      <div class="light-row">
+        <label for="led1Brightness">LED 1 · GPIO11</label>
+        <input id="led1Brightness" type="range" min="0" max="100" step="1" value="0" />
+        <output id="led1Value" for="led1Brightness">0%</output>
+      </div>
+      <div class="light-row">
+        <label for="led2Brightness">LED 2 · GPIO12</label>
+        <input id="led2Brightness" type="range" min="0" max="100" step="1" value="0" />
+        <output id="led2Value" for="led2Brightness">0%</output>
+      </div>
+      <div class="light-row">
+        <label for="led3Brightness">LED 3 · GPIO13</label>
+        <input id="led3Brightness" type="range" min="0" max="100" step="1" value="0" />
+        <output id="led3Value" for="led3Brightness">0%</output>
+      </div>
+      <button id="autoLighting" class="auto" type="button">恢复自动调光</button>
+      <p id="lightingStatus" class="muted status"></p>
+    </section>
+    <section class="card">
+      <h2>蜂鸣器</h2>
+      <div class="readout"><span class="muted">当前状态</span><strong id="buzzerCurrent">--</strong></div>
+      <label class="toggle-row" for="buzzerEnabled">
+        <span>启用告警声音</span><input id="buzzerEnabled" type="checkbox" />
+      </label>
+      <p id="buzzerStatus" class="muted status"></p>
+    </section>
     <script>
       const $ = (id) => document.getElementById(id),
         svg = $("servoDial"),
@@ -863,11 +926,16 @@ const char kActuatorPageV5[] PROGMEM = R"HTML(
         thumb = $("servoThumb"),
         servoNumber = $("servoNumber"),
         fanSpeed = $("fanSpeed"),
+        lightSliders = [$("led1Brightness"), $("led2Brightness"), $("led3Brightness")],
+        buzzerToggle = $("buzzerEnabled"),
         pathLength = progress.getTotalLength();
       let pendingServo = null,
         pendingFan = null,
-        pendingAuto = false,
+        pendingLighting = null,
+        pendingBuzzer = null,
+        pendingAuto = null,
         refreshWanted = false,
+        forceLightingRefresh = false,
         busy = false,
         failures = 0,
         fanDirection = 1,
@@ -890,10 +958,11 @@ const char kActuatorPageV5[] PROGMEM = R"HTML(
         if (busy) return;
         busy = true;
         try {
-          while (pendingAuto || pendingServo !== null || pendingFan !== null || refreshWanted) {
-            if (pendingAuto) {
-              pendingAuto = false;
-              await post({ mode: "auto" }, "servoStatus", "");
+          while (pendingAuto !== null || pendingServo !== null || pendingFan !== null || pendingLighting !== null || pendingBuzzer !== null || refreshWanted) {
+            if (pendingAuto !== null) {
+              const command = pendingAuto;
+              pendingAuto = null;
+              await post({ mode: command.mode }, command.statusId, "");
               refreshWanted = true;
               continue;
             }
@@ -911,6 +980,35 @@ const char kActuatorPageV5[] PROGMEM = R"HTML(
                 { fan_direction: String(command.direction), fan_speed: String(command.speed) },
                 "fanStatus",
                 "",
+              );
+              refreshWanted = true;
+              continue;
+            }
+            if (pendingLighting !== null) {
+              const brightness = pendingLighting;
+              pendingLighting = null;
+              await post(
+                {
+                  led1_brightness: String(brightness[0]),
+                  led2_brightness: String(brightness[1]),
+                  led3_brightness: String(brightness[2]),
+                },
+                "lightingStatus",
+                "",
+              );
+              // POST 完成后设备状态是权威值，即使滑块仍保持焦点也要同步，
+              // 避免界面显示值与实际 PWM 脱节。
+              forceLightingRefresh = true;
+              refreshWanted = true;
+              continue;
+            }
+            if (pendingBuzzer !== null) {
+              const enabled = pendingBuzzer;
+              pendingBuzzer = null;
+              await post(
+                { buzzer_enabled: enabled ? "1" : "0" },
+                "buzzerStatus",
+                enabled ? "蜂鸣器已启用" : "蜂鸣器已停用",
               );
               refreshWanted = true;
               continue;
@@ -956,20 +1054,51 @@ const char kActuatorPageV5[] PROGMEM = R"HTML(
               (s.fanManual ? "手动" : "自动")
             : "PWM 未就绪";
           if (document.activeElement !== fanSpeed && pendingFan === null) fanSpeed.value = s.fanSpeed;
+          $("lightingCurrent").textContent = s.lightingReady
+            ? s.lightingManual
+              ? "手动"
+              : "自动"
+            : "PWM 未就绪";
+          const brightness = [s.led1Brightness, s.led2Brightness, s.led3Brightness];
+          const syncLighting = forceLightingRefresh ||
+                               (pendingLighting === null &&
+                                !lightSliders.some((slider) => document.activeElement === slider));
+          lightSliders.forEach((slider, index) => {
+            if (syncLighting) slider.value = brightness[index];
+            $("led" + (index + 1) + "Value").textContent = slider.value + "%";
+          });
+          forceLightingRefresh = false;
+          $("buzzerCurrent").textContent = s.buzzerEnabled ? "已启用" : "已停用";
+          if (document.activeElement !== buzzerToggle && pendingBuzzer === null) {
+            buzzerToggle.checked = !!s.buzzerEnabled;
+          }
         } catch (e) {
           if (++failures >= 3) {
             $("servoStatus").textContent = "读取状态失败，正在重试";
             $("fanStatus").textContent = "读取状态失败，正在重试";
+            $("lightingStatus").textContent = "读取状态失败，正在重试";
+            $("buzzerStatus").textContent = "读取状态失败，正在重试";
           }
         }
       }
       function queueServo(angle) {
         servoDraw(angle);
+        if (pendingAuto !== null && pendingAuto.mode === "servo_auto") pendingAuto = null;
         pendingServo = Math.max(0, Math.min(180, Math.round(Number(angle) || 0)));
         kick();
       }
       function queueFan(direction) {
+        if (pendingAuto !== null && pendingAuto.mode === "fan_auto") pendingAuto = null;
         pendingFan = { direction: direction, speed: direction === 0 ? 0 : Number(fanSpeed.value) };
+        kick();
+      }
+      function queueLighting() {
+        if (pendingAuto !== null && pendingAuto.mode === "lighting_auto") pendingAuto = null;
+        pendingLighting = lightSliders.map((slider, index) => {
+          const value = Math.max(0, Math.min(100, Math.round(Number(slider.value) || 0)));
+          $("led" + (index + 1) + "Value").textContent = value + "%";
+          return value;
+        });
         kick();
       }
       function servoDrag(e) {
@@ -1014,11 +1143,23 @@ const char kActuatorPageV5[] PROGMEM = R"HTML(
       };
       fanSpeed.oninput = () => queueFan(Number(fanSpeed.value) === 0 ? 0 : fanDirection);
       $("autoServo").onclick = () => {
-        pendingAuto = true;
+        pendingServo = null;
+        pendingAuto = { mode: "servo_auto", statusId: "servoStatus" };
         kick();
       };
       $("autoFan").onclick = () => {
-        pendingAuto = true;
+        pendingFan = null;
+        pendingAuto = { mode: "fan_auto", statusId: "fanStatus" };
+        kick();
+      };
+      lightSliders.forEach((slider) => (slider.oninput = queueLighting));
+      $("autoLighting").onclick = () => {
+        pendingLighting = null;
+        pendingAuto = { mode: "lighting_auto", statusId: "lightingStatus" };
+        kick();
+      };
+      buzzerToggle.onchange = () => {
+        pendingBuzzer = buzzerToggle.checked;
         kick();
       };
       servoDraw(0);
@@ -1114,21 +1255,33 @@ void NetworkPortal::configureRoutes() {
     server_.send_P(200, "text/html; charset=utf-8", kActuatorPageV5);
   });
   server_.on("/api/actuator", HTTP_GET, [this]() {
-    char response[192];
+    char response[352];
     snprintf(response, sizeof(response),
-             "{\"ready\":%s,\"angle\":%u,\"manual\":%s,\"fanReady\":%s,\"fanRunning\":%s,\"fanManual\":%s,\"fanDirection\":%d,\"fanSpeed\":%u}",
+             "{\"ready\":%s,\"angle\":%u,\"manual\":%s,\"fanReady\":%s,\"fanRunning\":%s,\"fanManual\":%s,\"fanDirection\":%d,\"fanSpeed\":%u,\"lightingReady\":%s,\"lightingManual\":%s,\"led1Brightness\":%u,\"led2Brightness\":%u,\"led3Brightness\":%u,\"buzzerEnabled\":%s}",
              servoReady() ? "true" : "false", static_cast<unsigned int>(servoCurrentAngle()),
              servoManualMode() ? "true" : "false", fanReady() ? "true" : "false",
              fanRunning() ? "true" : "false", fanManualMode() ? "true" : "false",
-             static_cast<int>(fanDirection()), static_cast<unsigned int>(fanSpeedPercent()));
+             static_cast<int>(fanDirection()), static_cast<unsigned int>(fanSpeedPercent()),
+             lightingReady() ? "true" : "false", lightingManualMode() ? "true" : "false",
+             static_cast<unsigned int>(lightingBrightnessPercent(1)),
+             static_cast<unsigned int>(lightingBrightnessPercent(2)),
+             static_cast<unsigned int>(lightingBrightnessPercent(3)),
+             buzzerEnabled() ? "true" : "false");
     server_.sendHeader("Cache-Control", "no-store");
     server_.send(200, "application/json", response);
   });
   server_.on("/api/actuator", HTTP_POST, [this]() {
-    if (server_.arg("mode") == "auto") {
-      servoResumeAutomatic();
-      fanResumeAutomatic();
-      server_.send(200, "application/json", "{\"ok\":true,\"message\":\"已恢复自动控制\"}");
+    if (server_.hasArg("mode")) {
+      const String mode = server_.arg("mode");
+      if (mode == "auto" || mode == "servo_auto") servoResumeAutomatic();
+      if (mode == "auto" || mode == "fan_auto") fanResumeAutomatic();
+      if (mode == "auto" || mode == "lighting_auto") lightingResumeAutomatic();
+      if (mode == "auto" || mode == "servo_auto" || mode == "fan_auto" ||
+          mode == "lighting_auto") {
+        server_.send(200, "application/json", "{\"ok\":true,\"message\":\"已恢复自动控制\"}");
+        return;
+      }
+      server_.send(400, "application/json", "{\"ok\":false,\"message\":\"未知的自动控制模式\"}");
       return;
     }
     bool changed = false;
@@ -1163,6 +1316,45 @@ void NetworkPortal::configureRoutes() {
       message += (message.isEmpty() ? "" : "；") + String("风扇") +
                  (requestedSpeed == 0 ? "已停止" : (requestedDirection > 0 ? "正转 " : "反转 ")) +
                  String(requestedSpeed) + "%";
+    }
+    if (server_.hasArg("led1_brightness") || server_.hasArg("led2_brightness") ||
+        server_.hasArg("led3_brightness")) {
+      const int led1 = server_.hasArg("led1_brightness")
+                           ? server_.arg("led1_brightness").toInt()
+                           : lightingBrightnessPercent(1);
+      const int led2 = server_.hasArg("led2_brightness")
+                           ? server_.arg("led2_brightness").toInt()
+                           : lightingBrightnessPercent(2);
+      const int led3 = server_.hasArg("led3_brightness")
+                           ? server_.arg("led3_brightness").toInt()
+                           : lightingBrightnessPercent(3);
+      if (led1 < 0 || led1 > 100 || led2 < 0 || led2 > 100 || led3 < 0 || led3 > 100) {
+        server_.send(400, "application/json", "{\"ok\":false,\"message\":\"LED 亮度必须在 0 到 100 之间\"}");
+        return;
+      }
+      if (!lightingSetManual(static_cast<uint8_t>(led1), static_cast<uint8_t>(led2),
+                             static_cast<uint8_t>(led3))) {
+        server_.send(503, "application/json", "{\"ok\":false,\"message\":\"LED PWM 尚未就绪\"}");
+        return;
+      }
+      changed = true;
+      message += (message.isEmpty() ? "" : "；") + String("LED 亮度 ") + String(led1) +
+                 "/" + String(led2) + "/" + String(led3) + "%";
+    }
+    if (server_.hasArg("buzzer_enabled")) {
+      const String requested = server_.arg("buzzer_enabled");
+      if (requested != "0" && requested != "1" && requested != "false" && requested != "true") {
+        server_.send(400, "application/json", "{\"ok\":false,\"message\":\"蜂鸣器状态必须为 0 或 1\"}");
+        return;
+      }
+      const bool nextEnabled = requested == "1" || requested == "true";
+      if (!buzzerSetEnabled(nextEnabled)) {
+        server_.send(500, "application/json", "{\"ok\":false,\"message\":\"蜂鸣器设置写入 NVS 失败\"}");
+        return;
+      }
+      changed = true;
+      message += (message.isEmpty() ? "" : "；") +
+                 String(nextEnabled ? "蜂鸣器已启用" : "蜂鸣器已停用");
     }
     if (!changed) {
       server_.send(400, "application/json", "{\"ok\":false,\"message\":\"没有可执行的调试参数\"}");

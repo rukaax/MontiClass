@@ -1,6 +1,8 @@
 /**
  * @file sensors.h
- * @brief 两路光敏、MQ135、DHT11 与 LD2402 的统一采集接口。
+ * @brief 两路光敏、MQ135、DHT11 与 LD2402 的数据结构和采集接口声明。
+ *
+ * GPIO 初始化和实际读取实现集中在 src/main.cpp，便于初学者顺序阅读。
  */
 #pragma once
 

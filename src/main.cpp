@@ -291,6 +291,7 @@ float automaticLightLoad(float lightPercent, float holdPercent) {
   return constrain((holdPercent - lightPercent) / holdPercent, 0.0f, 1.0f);
 }
 
+// 综合传感器读数与阈值，产出各项告警布尔和 0..1 归一化负荷。
 EnvironmentStatus evaluateEnvironment(const SensorData& data,
                                       const Thresholds& currentThresholds) {
   EnvironmentStatus status;
@@ -327,6 +328,7 @@ EnvironmentStatus evaluateEnvironment(const SensorData& data,
   return status;
 }
 
+// 给自动照明返回一个方向指令：+1 提亮、-1 变暗、0 保持。
 int8_t automaticLightDirection(float currentPercent, float targetPercent) {
   // 室内光照误差超过 2 个百分点才调整，目标上下 2% 内保持当前 PWM。
   constexpr float kLightDeadbandPercent = 2.0f;
@@ -338,6 +340,7 @@ int8_t automaticLightDirection(float currentPercent, float targetPercent) {
   return 0;
 }
 
+// 查询 RTC 判断当前是否处于用户设置的自动调光时段内。
 bool automaticLightingScheduleActive(const Thresholds& currentThresholds) {
   RtcDateTime now;
   if (!rtcClock.read(now)) return false;
@@ -345,6 +348,7 @@ bool automaticLightingScheduleActive(const Thresholds& currentThresholds) {
   return lightingScheduleContainsMinute(currentThresholds, minuteOfDay);
 }
 
+// 带 1% 迟滞维护“室外是否够暗”的状态，防止阈值附近来回抖动。
 bool updateOutdoorDarkState(float outdoorPercent, float thresholdPercent) {
   constexpr float kOutdoorExitHysteresisPercent = 1.0f;
   if (!isfinite(outdoorPercent) || !isfinite(thresholdPercent) ||
@@ -362,6 +366,7 @@ bool updateOutdoorDarkState(float outdoorPercent, float thresholdPercent) {
   return automaticOutdoorDark;
 }
 
+// 维护“最近 60 秒内是否检测到人体”的状态，供节能策略使用。
 bool updatePresenceRecentState(bool presenceDetected) {
   constexpr uint32_t kNoPresenceTurnOffMs = 60000;
   const uint32_t now = millis();
@@ -374,6 +379,7 @@ bool updatePresenceRecentState(bool presenceDetected) {
   return automaticPresenceRecent;
 }
 
+// 依据 AQI/温度/湿度负荷合成一个 0..100% 的自动转速目标。
 uint8_t automaticFanSpeed(const EnvironmentStatus& status) {
   // 取 AQI、温度、湿度中最大的负荷作为主负荷，保证单项严重超限时风扇能
   // 快速提速；其余两项按 50% 权重叠加，使多项轻微超限也能适当增加转速。
@@ -395,6 +401,7 @@ uint8_t automaticFanSpeed(const EnvironmentStatus& status) {
                               blendedLoad * adjustableRange + 0.5f);
 }
 
+// 决定通风舵机开合角度：多项告警才打开。
 uint16_t automaticServoAngle(const EnvironmentStatus& status) {
   // 光照不足不参与开窗舵机判断。只有空气质量、温度、湿度三项计数，至少
   // 两项同时告警才打开，避免单个传感器瞬时波动频繁推动舵机。
@@ -404,6 +411,7 @@ uint16_t automaticServoAngle(const EnvironmentStatus& status) {
   return exceededCount >= 2 ? kServoOpenAngle : kServoClosedAngle;
 }
 
+// 综合最新传感器与环境状态，把自动目标下发给 LED / 风扇 / 舵机。
 void applyAutomaticControl(const EnvironmentStatus& status, const SensorData& data,
                            const Thresholds& currentThresholds,
                            bool lightSampled) {
@@ -442,6 +450,7 @@ void applyAutomaticControl(const EnvironmentStatus& status, const SensorData& da
 // SensorData 和 SensorManager 的声明仍放在 sensors.h，方便 OLED、WebUI 和上报
 // 模块共享数据类型；所有会接触 GPIO、ADC、DHT11 的实现都集中在本文件。
 
+// 配置 ADC/DHT11/LD2402 引脚，记录 MQ135 预热起点。
 void SensorManager::begin() {
   // ESP32-S3 ADC 配置为 12 位，原始范围为 0..4095。11dB 衰减允许测量较宽
   // 电压范围，但 GPIO 实际输入仍绝不能超过 3.3V，MQ135 必须先经过分压。
@@ -462,6 +471,7 @@ void SensorManager::begin() {
   mq135BaselineSamples_ = 0;
 }
 
+// 一轮采集：光敏 100ms、环境组 2s、返回本轮是否更新了光敏。
 bool SensorManager::update() {
   const uint32_t now = millis();
 
@@ -535,6 +545,7 @@ const SensorData& SensorManager::data() const {
   return data_;
 }
 
+// 对指定 ADC 引脚做 kAdcSamples 次平均，抑制电源纹波和瞬时噪声。
 uint16_t SensorManager::readAveragedAdc(uint8_t pin) {
   uint32_t sum = 0;
   // 8 个 12 位样本最大总和为 32760，使用 uint32_t 可明确避免累计溢出。
@@ -544,6 +555,7 @@ uint16_t SensorManager::readAveragedAdc(uint8_t pin) {
   return static_cast<uint16_t>(sum / SensorHardware::kAdcSamples);
 }
 
+// 与 readAveragedAdc 同理，但走 ESP32 校准过的毫伏读数。
 uint16_t SensorManager::readAveragedMillivolts(uint8_t pin) {
   uint32_t sum = 0;
   for (uint8_t i = 0; i < SensorHardware::kAdcSamples; ++i) {
@@ -602,6 +614,7 @@ void lightingInit() {
                 LightingHardware::kLedSupplyMillivolts);
 }
 
+// 自动模式下按 direction 增/减/保持三路同步占空比。
 void lightingAdjustAutomatic(int8_t direction) {
   // 手动模式下忽略自动增量命令，才能让 WebUI 滑块保持稳定。
   if (!LightingHardware::ready || LightingHardware::manual) return;
@@ -627,6 +640,7 @@ void lightingAdjustAutomatic(int8_t direction) {
   }
 }
 
+// 自动模式下把三路 LED 全部关掉；手动模式不受影响。
 void lightingTurnOffAutomatic() {
   if (!LightingHardware::ready || LightingHardware::manual) return;
   LightingHardware::writeDuty(
@@ -637,6 +651,7 @@ void lightingTurnOffAutomatic() {
       LightingHardware::kLed3Channel, 0, LightingHardware::led3Duty);
 }
 
+// WebUI 手动模式：三路各自设置 0..100% 亮度，进入 manual 状态。
 bool lightingSetManual(uint8_t led1Percent, uint8_t led2Percent,
                        uint8_t led3Percent) {
   if (!LightingHardware::ready || led1Percent > 100 || led2Percent > 100 ||
@@ -661,6 +676,7 @@ bool lightingSetManual(uint8_t led1Percent, uint8_t led2Percent,
   return true;
 }
 
+// 退出手动模式；下一轮 loop() 会根据光敏读数重新自动调光。
 void lightingResumeAutomatic() {
   // 此处只退出手动覆盖。loop() 下一轮会使用最新光敏读数重新计算并下发亮度。
   LightingHardware::manual = false;
@@ -719,6 +735,7 @@ void fanInit() {
                 static_cast<unsigned long>(FanHardware::kPwmFrequencyHz));
 }
 
+// 自动风扇每 100ms 向目标 ±1% 靠拢；起停/换向单独走可靠起转速度。
 void fanApplyAutomatic(int8_t nextDirection, uint8_t desiredSpeed) {
   if (!FanHardware::ready || FanHardware::manual) return;
   if ((nextDirection != -1 && nextDirection != 1) || desiredSpeed > 100) return;
@@ -770,6 +787,7 @@ void fanApplyAutomatic(int8_t nextDirection, uint8_t desiredSpeed) {
   FanHardware::automaticNeedsApply = false;
 }
 
+// WebUI 手动模式：直接写入方向和转速，进入 manual 状态。
 bool fanSetManual(int8_t nextDirection, uint8_t speedPercent) {
   if (!FanHardware::ready || nextDirection == 0 || speedPercent > 100) return false;
   FanHardware::manual = true;
@@ -779,6 +797,7 @@ bool fanSetManual(int8_t nextDirection, uint8_t speedPercent) {
   return true;
 }
 
+// 退出手动模式，让下一轮 loop() 根据环境负荷重新决定转速。
 void fanResumeAutomatic() {
   // 不在按钮回调里猜测自动转速，交给下一轮 loop() 使用最新传感器状态决定。
   FanHardware::manual = false;
@@ -796,6 +815,7 @@ uint8_t fanSpeedPercent() { return FanHardware::speed; }
 // SG90 舵机初始化、自动输出和 WebUI 手动覆盖
 // ===========================================================================
 
+// 初始化 SG90 舵机 MCPWM（UNIT_0, 50Hz, 500..2500us 脉宽）。
 void servoInit() {
   pinMode(Pins::kServo, OUTPUT);
   const esp_err_t gpioResult = mcpwm_gpio_init(
@@ -822,6 +842,7 @@ void servoInit() {
                 static_cast<unsigned int>(ServoHardware::kPwmFrequencyHz));
 }
 
+// 自动模式下把舵机转到指定角度；同角度不重复写寄存器。
 void servoApplyAutomaticAngle(uint16_t angle) {
   if (!ServoHardware::ready || ServoHardware::manual || angle > 180) return;
   // 目标不变时不重复输出。用户从手动恢复自动后 automaticNeedsApply 为 true，
@@ -835,6 +856,7 @@ void servoApplyAutomaticAngle(uint16_t angle) {
   Serial.printf("[SERVO] automatic target=%u deg\r\n", angle);
 }
 
+// WebUI 手动模式：直接锁定舵机角度，进入 manual 状态。
 bool servoSetManualAngle(uint16_t angle) {
   if (!ServoHardware::ready || angle > 180) return false;
   ServoHardware::manual = true;
@@ -843,6 +865,7 @@ bool servoSetManualAngle(uint16_t angle) {
   return true;
 }
 
+// 退出手动模式，下一轮 loop() 会重新计算并下发自动角度。
 void servoResumeAutomatic() {
   ServoHardware::manual = false;
   ServoHardware::automaticNeedsApply = true;

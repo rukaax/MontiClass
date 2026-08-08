@@ -1,38 +1,47 @@
 /** @file network_portal.cpp
  * @brief 无密码热点配网、WebUI 和 Wi-Fi 凭据的本地 NVS 存储。
+ *
+ * 阅读顺序建议：
+ *   1. begin() 是入口，决定“进入配网”还是“连接已保存的 Wi-Fi”。
+ *   2. startProvisioning() / startStation() 是两条主路径的实现。
+ *   3. update() 是主循环调用，负责推动状态机、处理 HTTP/DNS、异步扫描收割。
+ *   4. configureRoutes() 及各个 send / receive 方法是 WebUI 的路由与处理器。
+ *   前面 kWebPage 之前是内嵌的 HTML/CSS/JS 页面文本，只是字符串常量。
  */
 #include "network_portal.h"
 
-#include <Preferences.h>
-#include <WiFi.h>
+#include <Preferences.h>     // ESP32 NVS 读写库，用于持久化 Wi-Fi 凭据
+#include <WiFi.h>            // Arduino WiFi 类：AP/STA、扫描、状态
 
-#include <math.h>
-#include <stdio.h>
+#include <math.h>            // isnan()
+#include <stdio.h>           // sscanf / snprintf
 
-#include "SSD1306.h"
-#include "buzzer.h"
-#include "fan.h"
-#include "lighting.h"
-#include "servo.h"
-#include "threshold_store.h"
+#include "SSD1306.h"         // 配网/连接提示屏幕的绘制函数
+#include "buzzer.h"          // WebUI 里控制蜂鸣器开关
+#include "fan.h"              // WebUI 里查询/覆盖风扇状态
+#include "lighting.h"        // WebUI 里查询/覆盖 LED 状态
+#include "servo.h"           // WebUI 里查询/覆盖舵机角度
+#include "threshold_store.h" // 光照阈值和调光时段的持久化
 
 namespace {
-constexpr char kWifiNamespace[] = "wifi_config";
-constexpr char kSsidKey[] = "ssid";
-constexpr char kPasswordKey[] = "password";
-constexpr uint32_t kConnectionTimeoutMs = 15000;
+// ===== NVS 存储 & 时间常量 =====
+constexpr char kWifiNamespace[] = "wifi_config";           // Wi-Fi 凭据的 NVS 命名空间
+constexpr char kSsidKey[] = "ssid";                        // 保存 SSID 的键
+constexpr char kPasswordKey[] = "password";                // 保存密码的键
+constexpr uint32_t kConnectionTimeoutMs = 15000;           // 连接 STA 超时 15s，超时回落到配网
 // 配网提示页显示 1 分钟，之后 OLED 回到监测页，但热点和 WebUI 保留。
 constexpr uint32_t kProvisioningScreenTimeoutMs = 60000;
-constexpr uint32_t kApHealthCheckIntervalMs = 5000;
-constexpr uint8_t kNetworkScanMaxAttempts = 3;
+constexpr uint32_t kApHealthCheckIntervalMs = 5000;        // 每 5s 检查一次 AP 是否还在
+constexpr uint8_t kNetworkScanMaxAttempts = 3;             // 扫描失败时最多重试 3 次
 // scanComplete() 在射频被 AP/STA 抢占时可能长期停在 -1，必须自己兜底，
 // 否则 networkScanRunning_ 永久为真，之后所有扫描请求都被拒绝。
 constexpr uint32_t kNetworkScanTimeoutMs = 12000;
 
+// 把 "HH:MM" 解析成一天中的分钟数（0..1439）；不合法返回 false。
 bool parseTimeOfDay(const String& text, uint16_t& minuteOfDay) {
   unsigned int hour = 0;
   unsigned int minute = 0;
-  char trailing = '\0';
+  char trailing = '\0';                             // 只允许恰好两个数字段，多余字符判失败
   if (sscanf(text.c_str(), "%u:%u%c", &hour, &minute, &trailing) != 2 ||
       hour > 23 || minute > 59) {
     return false;
@@ -41,6 +50,7 @@ bool parseTimeOfDay(const String& text, uint16_t& minuteOfDay) {
   return true;
 }
 
+// 反向：把一天中的分钟数格式化成 "HH:MM"，写入调用方提供的缓冲。
 void formatTimeOfDay(uint16_t minuteOfDay, char* output, size_t outputSize) {
   snprintf(output, outputSize, "%02u:%02u", minuteOfDay / 60U, minuteOfDay % 60U);
 }
@@ -1335,24 +1345,28 @@ const char kWebUiFixes[] PROGMEM = R"HTML(
 )HTML";
 
 
+// 数字转 JSON：NaN 输出 "null"，其他按指定小数位数格式化。
 String jsonNumber(float value, uint8_t digits) {
   return isnan(value) ? "null" : String(value, static_cast<unsigned int>(digits));
 }
 
+// 对字符串做最小 JSON 转义：引号/反斜杠/换行/回车。
 String escapeJson(const String& value) {
   String escaped;
-  escaped.reserve(value.length() + 4);
+  escaped.reserve(value.length() + 4);        // 预留一点余量，减少扩容
   for (size_t i = 0; i < value.length(); ++i) {
     const char c = value[i];
-    if (c == '"' || c == '\\') escaped += '\\';
-    if (c == '\n') escaped += "\\n";
-    else if (c == '\r') escaped += "\\r";
-    else if (c != '\n') escaped += c;
+    if (c == '"' || c == '\\') escaped += '\\';  // 引号 / 反斜杠 前加转义
+    if (c == '\n') escaped += "\\n";                // 换行
+    else if (c == '\r') escaped += "\\r";           // 回车
+    else if (c != '\n') escaped += c;                // 其它字符原样输出
   }
   return escaped;
 }
 }  // namespace
 
+// 把所有 HTTP 路由注册到内嵌 WebServer。首页动态拼装几段脚本；
+// 其它路由委托到本类的成员函数处理，逻辑较重的 /api/actuator 直接就地实现。
 void NetworkPortal::configureRoutes() {
   reportUploader_.configureRoutes(server_);
   server_.on("/", HTTP_GET, [this]() {
@@ -1498,6 +1512,7 @@ void NetworkPortal::configureRoutes() {
   server_.onNotFound([this]() { server_.sendHeader("Location", "/"); server_.send(302); });
 }
 
+// 从 NVS 读出保存过的 SSID / 密码；SSID 为空视为“还没配过网”。
 bool NetworkPortal::loadCredentials(String& ssid, String& password) {
   Preferences preferences;
   if (!preferences.begin(kWifiNamespace, true)) return false;
@@ -1507,6 +1522,7 @@ bool NetworkPortal::loadCredentials(String& ssid, String& password) {
   return !ssid.isEmpty();
 }
 
+// 把 SSID / 密码写入 NVS；putString 返回写入字节数，与字符串长度相同才算成功。
 bool NetworkPortal::saveCredentials(const String& ssid, const String& password) {
   Preferences preferences;
   if (!preferences.begin(kWifiNamespace, false)) return false;
@@ -1516,6 +1532,7 @@ bool NetworkPortal::saveCredentials(const String& ssid, const String& password) 
   return ssidSaved && passwordSaved;
 }
 
+// 清除 NVS 中所有 Wi-Fi 凭据，用于用户主动“忘记网络”。
 void NetworkPortal::clearCredentials() {
   Preferences preferences;
   if (preferences.begin(kWifiNamespace, false)) {
@@ -1524,6 +1541,7 @@ void NetworkPortal::clearCredentials() {
   }
 }
 
+// 进入配网模式：启动无密码软 AP + captive DNS，OLED 显示热点名和二维码。
 void NetworkPortal::startProvisioning() {
   // AP+STA 允许配网页在不掉热点的情况下扫描附近路由器。
   WiFi.mode(WIFI_AP_STA);
@@ -1553,6 +1571,7 @@ void NetworkPortal::startProvisioning() {
                 apSsid_.c_str(), WiFi.softAPIP().toString().c_str());
 }
 
+// 停止 AP/DNS，切换到 STA 模式尝试连接指定 SSID；连接结果由 update() 轮询。
 void NetworkPortal::startStation(const String& ssid, const String& password) {
   // 上电首次进入这里时无线栈还未创建，必须先设置模式再调用 AP 操作。
   WiFi.mode(WIFI_STA);
@@ -1570,6 +1589,7 @@ void NetworkPortal::startStation(const String& ssid, const String& password) {
   Serial.printf("[WiFi] connecting to saved SSID: %s\r\n", ssid.c_str());
 }
 
+// 上电初始化：注册路由、加载凭据，能连就连、连不上就开配网热点。
 void NetworkPortal::begin() {
   reportUploader_.begin();
   configureRoutes();
@@ -1585,10 +1605,12 @@ void NetworkPortal::begin() {
   server_.begin();
 }
 
+// 由 main 注入阈值对象引用，供 /api/lighting-config 读写。
 void NetworkPortal::setThresholds(Thresholds& thresholds) {
   thresholds_ = &thresholds;
 }
 
+// GET /api/status - 汇总传感器读数、联网状态、RTC 时间返给 WebUI 首页。
 void NetworkPortal::sendStatus() {
   const SensorData emptyData{};
   const SensorData& data = latestData_ == nullptr ? emptyData : *latestData_;
@@ -1616,6 +1638,7 @@ void NetworkPortal::sendStatus() {
   server_.send(200, "application/json", response);
 }
 
+// GET /api/lighting-config - 返回照明阈值、时间段及当前自动决策依据。
 void NetworkPortal::sendLightingConfig() {
   const Thresholds empty{};
   const Thresholds& thresholds = thresholds_ == nullptr ? empty : *thresholds_;
@@ -1646,6 +1669,7 @@ void NetworkPortal::sendLightingConfig() {
   server_.send(200, "application/json", response);
 }
 
+// POST /api/lighting-config - 校验并保存 WebUI 提交的照明参数。
 void NetworkPortal::receiveLightingConfig() {
   if (thresholds_ == nullptr) {
     server_.send(503, "application/json", "{\"ok\":false,\"message\":\"阈值尚未就绪\"}");
@@ -1686,6 +1710,8 @@ void NetworkPortal::receiveLightingConfig() {
   server_.send(200, "application/json", "{\"ok\":true,\"message\":\"光照设置已保存\"}");
 }
 
+// GET /api/time - 返回 RTC 当前时间、NTP 服务器和同步状态。
+// GET /api/time - 返回当前 RTC 时间、NTP 服务器和同步状态给 WebUI。
 void NetworkPortal::sendTime() {
   const String now = rtcClock.isoString();
   const String date = now.length() >= 10 ? now.substring(0, 10) : String();
@@ -1699,6 +1725,7 @@ void NetworkPortal::sendTime() {
   server_.send(200, "application/json", response);
 }
 
+// POST /api/time - 支持修改 NTP 服务器、手动设置时间或触发一次 NTP 校时。
 void NetworkPortal::receiveTime() {
   const String ntpServer = server_.arg("ntp_server");
   if (!ntpServer.isEmpty() && !rtcClock.setNtpServer(ntpServer)) {
@@ -1745,6 +1772,7 @@ void NetworkPortal::receiveTime() {
   server_.send(200, "application/json", String("{\"ok\":true,\"message\":\"") + message + "\"}");
 }
 
+// GET /api/networks - 返回上一次扫描的 SSID 列表；start=1 触发新一次异步扫描。
 void NetworkPortal::sendNetworks() {
   // 联网后也允许扫描：用户需要在 WebUI 里换到另一个网络。
   // start=1 只由按钮发出；后续轮询不再误触发新扫描或覆盖完成结果。
@@ -1757,6 +1785,7 @@ void NetworkPortal::sendNetworks() {
   server_.send(200, "application/json", networkListJson_);
 }
 
+// 启动一次异步 Wi-Fi 扫描；失败时按 kNetworkScanMaxAttempts 有限次重试。
 bool NetworkPortal::startNetworkScan() {
   if (networkScanRunning_) return false;
   // 必须异步扫描：同步扫全信道会堵住 OLED、传感器和串口数秒。
@@ -1779,6 +1808,7 @@ bool NetworkPortal::startNetworkScan() {
   return true;
 }
 
+// AP watchdog：配网期间若热点被外部关闭（例如射频冲突），自动重开。
 void NetworkPortal::ensureProvisioningAp() {
   if (!provisioning_) return;
   const wifi_mode_t mode = WiFi.getMode();
@@ -1794,6 +1824,7 @@ void NetworkPortal::ensureProvisioningAp() {
   dnsServer_.start(53, "*", WiFi.softAPIP());
 }
 
+// POST /api/wifi - 接收用户提交的 SSID/密码，校验后延后触发切换到 STA。
 void NetworkPortal::receiveCredentials() {
   const String ssid = server_.arg("ssid");
   const String password = server_.arg("password");
@@ -1812,6 +1843,7 @@ void NetworkPortal::receiveCredentials() {
   server_.send(200, "text/html; charset=utf-8", "<p>已保存，设备正在连接 Wi-Fi。热点会关闭。</p>");
 }
 
+// 主循环调用：驱动 DNS/HTTP、消费扫描结果、切换连接状态、驱动上报模块。
 void NetworkPortal::update(const SensorData& latestData) {
   latestData_ = &latestData;
   if (provisioning_) {
@@ -1900,22 +1932,27 @@ void NetworkPortal::update(const SensorData& latestData) {
   reportUploader_.update(latestData);
 }
 
+// 配网提示或“连接中”期间返回 true，主页面不应覆盖 OLED。
 bool NetworkPortal::isShowingNetworkScreen() const {
   return (provisioning_ && provisioningScreenVisible_) || connecting_;
 }
 
+// 只有既不在配网也不在连接过程中、并且 STA 已连成功，才算“已联网”。
 bool NetworkPortal::isStationConnected() const {
   return !provisioning_ && !connecting_ && WiFi.status() == WL_CONNECTED;
 }
 
+// 已联网时返回 STA 侧 IP 字符串，否则返回空串。
 String NetworkPortal::stationIpAddress() const {
   return isStationConnected() ? WiFi.localIP().toString() : String();
 }
 
+// 透传数据上报模块的最新状态给 OLED / WebUI。
 ReportUploadStatus NetworkPortal::reportUploadStatus() const {
   return reportUploader_.status();
 }
 
+// 一次性事件：只在“刚连上路由器”那一轮返回 true，读走后自动清零。
 bool NetworkPortal::takeConnectionSucceeded() {
   const bool succeeded = connectionSucceeded_;
   connectionSucceeded_ = false;

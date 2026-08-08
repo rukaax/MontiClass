@@ -9,11 +9,13 @@
 #include "report_uploader.h"
 #include "rtc_clock.h"
 #include "sensors.h"
+#include "thresholds.h"
 
 class NetworkPortal {
  public:
   // 自动读取本地凭据：没有凭据时创建无密码配网热点。
   void begin();
+  void setThresholds(Thresholds& thresholds);
   // 每次 loop 调用，维护 HTTP/DNS 请求及 Wi-Fi 连接状态。
   void update(const SensorData& latestData);
   // 成功连上路由器后只返回一次 true，供主界面切回监测页。
@@ -33,6 +35,8 @@ class NetworkPortal {
   bool saveCredentials(const String& ssid, const String& password);
   void clearCredentials();
   void sendStatus();
+  void sendLightingConfig();
+  void receiveLightingConfig();
   void sendTime();
   void receiveTime();
   void sendNetworks();
@@ -44,6 +48,7 @@ class NetworkPortal {
   DNSServer dnsServer_;
   ReportUploader reportUploader_;
   const SensorData* latestData_ = nullptr;
+  Thresholds* thresholds_ = nullptr;
   String apSsid_;
   String pendingSsid_;
   String pendingPassword_;

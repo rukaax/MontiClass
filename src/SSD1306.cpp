@@ -129,10 +129,11 @@ void drawSettings(const Thresholds& thresholds, uint8_t selectedIndex, bool edit
                   const ReportUploadStatus& reportStatus, bool showNetworkInfo) {
   // 这里使用局部快照数组，仅用于把结构体按固定菜单顺序渲染；修改操作
   // 仍由 main.cpp 统一完成，避免显示层拥有业务状态。
-  const char* labels[] = {"光照下限", "空气", "温度", "湿度"};
-  const float values[] = {thresholds.lightPercent, thresholds.mq135Aqi,
+  const char* labels[] = {"室外阈值", "室内目标", "空气", "温度", "湿度"};
+  const float values[] = {thresholds.outdoorLightThresholdPercent,
+                          thresholds.lightHoldPercent, thresholds.mq135Aqi,
                           thresholds.temperatureC, thresholds.humidityPercent};
-  const char* units[] = {"%", "AQI", "C", "%"};
+  const char* units[] = {"%", "%", "AQI", "C", "%"};
   char line[28];
 
   u8g2_ClearBuffer(&oled);
@@ -140,7 +141,7 @@ void drawSettings(const Thresholds& thresholds, uint8_t selectedIndex, bool edit
   u8g2_DrawBox(&oled, 0, 0, 128, 14);
   u8g2_SetDrawColor(&oled, 0);
   const char* title = showNetworkInfo ? "网络信息  向上返回" :
-                      (editing ? "调节阈值  短按确认" : "选择项目  短按调节");
+                      (editing ? "调节设置  短按确认" : "选择项目  短按调节");
   u8g2_DrawUTF8(&oled, 2, 12, title);
   u8g2_SetDrawColor(&oled, 1);
 
@@ -187,11 +188,12 @@ void drawSettings(const Thresholds& thresholds, uint8_t selectedIndex, bool edit
     return;
   }
 
+  const uint8_t firstVisibleIndex = selectedIndex > 3 ? selectedIndex - 3 : 0;
   for (uint8_t row = 0; row < 4; ++row) {
     // 基线从 26 到 62，每行相隔 12 像素，与 wqy12 字体高度匹配。
     const uint8_t y = 26 + row * 12;
-    const uint8_t thresholdIndex = row;
-    if (thresholdIndex == 2) {
+    const uint8_t thresholdIndex = firstVisibleIndex + row;
+    if (thresholdIndex == 3) {
       snprintf(line, sizeof(line), "%s: %4.1f%s", labels[thresholdIndex],
                values[thresholdIndex], units[thresholdIndex]);
     } else {

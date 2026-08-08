@@ -7,12 +7,14 @@
 #include <WiFi.h>
 
 #include <math.h>
+#include <stdio.h>
 
 #include "SSD1306.h"
 #include "buzzer.h"
 #include "fan.h"
 #include "lighting.h"
 #include "servo.h"
+#include "threshold_store.h"
 
 namespace {
 constexpr char kWifiNamespace[] = "wifi_config";
@@ -26,6 +28,22 @@ constexpr uint8_t kNetworkScanMaxAttempts = 3;
 // scanComplete() 在射频被 AP/STA 抢占时可能长期停在 -1，必须自己兜底，
 // 否则 networkScanRunning_ 永久为真，之后所有扫描请求都被拒绝。
 constexpr uint32_t kNetworkScanTimeoutMs = 12000;
+
+bool parseTimeOfDay(const String& text, uint16_t& minuteOfDay) {
+  unsigned int hour = 0;
+  unsigned int minute = 0;
+  char trailing = '\0';
+  if (sscanf(text.c_str(), "%u:%u%c", &hour, &minute, &trailing) != 2 ||
+      hour > 23 || minute > 59) {
+    return false;
+  }
+  minuteOfDay = static_cast<uint16_t>(hour * 60U + minute);
+  return true;
+}
+
+void formatTimeOfDay(uint16_t minuteOfDay, char* output, size_t outputSize) {
+  snprintf(output, outputSize, "%02u:%02u", minuteOfDay / 60U, minuteOfDay % 60U);
+}
 
 const char kWebPage[] PROGMEM = R"HTML(
 <!doctype html>
@@ -146,6 +164,29 @@ const char kWebPage[] PROGMEM = R"HTML(
       </div>
     </section>
     <section class="card">
+      <h2>夜间照明</h2>
+      <div class="grid">
+        <div>室内光照 1<div id="lightingLight1" class="value">--</div></div>
+        <div>室外光照 2<div id="lightingLight2" class="value">--</div></div>
+      </div>
+      <form id="lightingConfigForm" onsubmit="saveLightingConfig(event)">
+        <label>室外开灯阈值（光敏 2）
+          <input id="outdoorLightThreshold" type="range" min="0" max="100" step="1" />
+          <output id="outdoorLightThresholdValue">--%</output>
+        </label>
+        <label>室内目标光照（光敏 1）
+          <input id="lightHold" type="range" min="0" max="100" step="1" />
+          <output id="lightHoldValue">--%</output>
+        </label>
+        <div class="grid">
+          <label>自动调光开始<input id="lightingStart" type="time" step="60" required /></label>
+          <label>自动调光结束<input id="lightingEnd" type="time" step="60" required /></label>
+        </div>
+        <button type="submit">保存照明设置</button>
+      </form>
+      <p id="lightingConfigStatus" class="muted">读取中…</p>
+    </section>
+    <section class="card">
       <h2>Wi-Fi 配网</h2>
       <p class="muted">
         扫描后从下拉框选择附近网络；隐藏网络可选“手动输入”。保存后设备将关闭配网热点并尝试连接。
@@ -217,6 +258,8 @@ const char kWebPage[] PROGMEM = R"HTML(
     <script>
       const unit = { light: "%", light2: "%", air: " AQI", temperature: " °C", humidity: "%" };
       const reportingForm = document.getElementById("reportingForm");
+      const lightingConfigForm = document.getElementById("lightingConfigForm");
+      let lightingConfigDirty = false;
       const dirtyReportFields = new Set();
       let reportFormLoaded = false,
         reportSaving = false;
@@ -229,6 +272,77 @@ const char kWebPage[] PROGMEM = R"HTML(
       function val(v, k) {
         return v === null ? "--" : v + unit[k];
       }
+      function renderLightingConfig(s, force = false) {
+        if (force || !lightingConfigDirty) {
+          document.getElementById("outdoorLightThreshold").value = s.threshold;
+          document.getElementById("lightHold").value = s.hold;
+          document.getElementById("lightingStart").value = s.start;
+          document.getElementById("lightingEnd").value = s.end;
+        }
+        document.getElementById("lightingLight1").textContent = s.light1 + "%";
+        document.getElementById("lightingLight2").textContent = s.light2 + "%";
+        document.getElementById("outdoorLightThresholdValue").textContent =
+          document.getElementById("outdoorLightThreshold").value + "%";
+        document.getElementById("lightHoldValue").textContent =
+          document.getElementById("lightHold").value + "%";
+        if (!lightingConfigDirty) {
+          document.getElementById("lightingConfigStatus").textContent = !s.automatic
+            ? "手动照明模式"
+            : !s.rtcValid
+              ? "RTC 时间无效，自动照明已关闭"
+              : s.scheduleActive
+                ? !s.presenceRecent
+                  ? "连续 1 分钟无人，照明已关闭"
+                  : s.outdoorDark
+                    ? "室外低于阈值，正在调节室内光照"
+                    : "室外未低于阈值，照明已关闭"
+                : "自动调光时段外，照明已关闭";
+        }
+      }
+      async function refreshLightingConfig(force = false) {
+        try {
+          const r = await fetch("/api/lighting-config", { cache: "no-store" });
+          if (!r.ok) throw new Error(r.status);
+          renderLightingConfig(await r.json(), force);
+        } catch (e) {
+          document.getElementById("lightingConfigStatus").textContent = "读取照明设置失败";
+        }
+      }
+      async function saveLightingConfig(e) {
+        e.preventDefault();
+        const status = document.getElementById("lightingConfigStatus");
+        try {
+          status.textContent = "正在保存…";
+          const r = await fetch("/api/lighting-config", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({
+              threshold: document.getElementById("outdoorLightThreshold").value,
+              hold: document.getElementById("lightHold").value,
+              start: document.getElementById("lightingStart").value,
+              end: document.getElementById("lightingEnd").value,
+            }),
+          });
+          const j = await r.json();
+          if (!r.ok || !j.ok) throw new Error(j.message || r.status);
+          lightingConfigDirty = false;
+          status.textContent = j.message || "照明设置已保存";
+          await refreshLightingConfig(true);
+        } catch (e) {
+          status.textContent = "保存失败：" + (e.message || "请求错误");
+        }
+      }
+      ["outdoorLightThreshold", "lightHold", "lightingStart", "lightingEnd"].forEach((id) => {
+        document.getElementById(id).addEventListener("input", () => {
+          lightingConfigDirty = true;
+        });
+      });
+      document.getElementById("lightHold").addEventListener("input", (e) => {
+        document.getElementById("lightHoldValue").textContent = e.target.value + "%";
+      });
+      document.getElementById("outdoorLightThreshold").addEventListener("input", (e) => {
+        document.getElementById("outdoorLightThresholdValue").textContent = e.target.value + "%";
+      });
       async function refresh() {
         try {
           let s = await (await fetch("/api/status", { cache: "no-store" })).json();
@@ -242,6 +356,7 @@ const char kWebPage[] PROGMEM = R"HTML(
             : s.connected
               ? "设备 IP：" + s.ip
               : "设备 IP：未连接";
+          refreshLightingConfig();
         } catch (e) {
           document.getElementById("network").textContent = "读取设备状态失败";
         }
@@ -1062,7 +1177,8 @@ const char kActuatorPageV5[] PROGMEM = R"HTML(
           const brightness = [s.led1Brightness, s.led2Brightness, s.led3Brightness];
           const syncLighting = forceLightingRefresh ||
                                (pendingLighting === null &&
-                                !lightSliders.some((slider) => document.activeElement === slider));
+                                (!s.lightingManual ||
+                                 !lightSliders.some((slider) => document.activeElement === slider)));
           lightSliders.forEach((slider, index) => {
             if (syncLighting) slider.value = brightness[index];
             $("led" + (index + 1) + "Value").textContent = slider.value + "%";
@@ -1246,6 +1362,8 @@ void NetworkPortal::configureRoutes() {
     server_.send(200, "text/html; charset=utf-8", page);
   });
   server_.on("/api/status", HTTP_GET, [this]() { sendStatus(); });
+  server_.on("/api/lighting-config", HTTP_GET, [this]() { sendLightingConfig(); });
+  server_.on("/api/lighting-config", HTTP_POST, [this]() { receiveLightingConfig(); });
   server_.on("/time", HTTP_GET, [this]() {
     server_.sendHeader("Cache-Control", "no-store");
     server_.send_P(200, "text/html; charset=utf-8", kTimePageV2);
@@ -1467,6 +1585,10 @@ void NetworkPortal::begin() {
   server_.begin();
 }
 
+void NetworkPortal::setThresholds(Thresholds& thresholds) {
+  thresholds_ = &thresholds;
+}
+
 void NetworkPortal::sendStatus() {
   const SensorData emptyData{};
   const SensorData& data = latestData_ == nullptr ? emptyData : *latestData_;
@@ -1492,6 +1614,76 @@ void NetworkPortal::sendStatus() {
                      (stationConnected ? WiFi.localIP().toString() : String())) + "\"}";
   server_.sendHeader("Cache-Control", "no-store");
   server_.send(200, "application/json", response);
+}
+
+void NetworkPortal::sendLightingConfig() {
+  const Thresholds empty{};
+  const Thresholds& thresholds = thresholds_ == nullptr ? empty : *thresholds_;
+  const SensorData emptyData{};
+  const SensorData& data = latestData_ == nullptr ? emptyData : *latestData_;
+  char start[6];
+  char end[6];
+  formatTimeOfDay(thresholds.lightingStartMinute, start, sizeof(start));
+  formatTimeOfDay(thresholds.lightingEndMinute, end, sizeof(end));
+  RtcDateTime now;
+  const bool rtcValid = rtcClock.read(now);
+  const uint16_t minuteOfDay =
+      rtcValid ? static_cast<uint16_t>(now.hour * 60U + now.minute) : 0;
+  const bool scheduleActive =
+      rtcValid && lightingScheduleContainsMinute(thresholds, minuteOfDay);
+  const bool outdoorDark = lightingOutdoorDark();
+  const bool presenceRecent = lightingPresenceRecent();
+  char response[352];
+  snprintf(response, sizeof(response),
+           "{\"light1\":%.0f,\"light2\":%.0f,\"threshold\":%.0f,\"hold\":%.0f,\"start\":\"%s\",\"end\":\"%s\",\"automatic\":%s,\"rtcValid\":%s,\"scheduleActive\":%s,\"outdoorDark\":%s,\"presenceRecent\":%s}",
+           data.light1Percent, data.light2Percent,
+           thresholds.outdoorLightThresholdPercent,
+           thresholds.lightHoldPercent, start, end,
+           lightingManualMode() ? "false" : "true",
+           rtcValid ? "true" : "false", scheduleActive ? "true" : "false",
+           outdoorDark ? "true" : "false", presenceRecent ? "true" : "false");
+  server_.sendHeader("Cache-Control", "no-store");
+  server_.send(200, "application/json", response);
+}
+
+void NetworkPortal::receiveLightingConfig() {
+  if (thresholds_ == nullptr) {
+    server_.send(503, "application/json", "{\"ok\":false,\"message\":\"阈值尚未就绪\"}");
+    return;
+  }
+  if (!server_.hasArg("threshold") || !server_.hasArg("hold") ||
+      !server_.hasArg("start") || !server_.hasArg("end")) {
+    server_.send(400, "application/json", "{\"ok\":false,\"message\":\"照明设置不完整\"}");
+    return;
+  }
+  const int threshold = server_.arg("threshold").toInt();
+  const int hold = server_.arg("hold").toInt();
+  if (threshold < 0 || threshold > 100) {
+    server_.send(400, "application/json", "{\"ok\":false,\"message\":\"室外光照阈值必须在0到100之间\"}");
+    return;
+  }
+  if (hold < 0 || hold > 100) {
+    server_.send(400, "application/json", "{\"ok\":false,\"message\":\"光照保持率必须在0到100之间\"}");
+    return;
+  }
+  uint16_t start = 0;
+  uint16_t end = 0;
+  if (!parseTimeOfDay(server_.arg("start"), start) ||
+      !parseTimeOfDay(server_.arg("end"), end)) {
+    server_.send(400, "application/json", "{\"ok\":false,\"message\":\"时间必须使用24小时制 HH:MM\"}");
+    return;
+  }
+  Thresholds next = *thresholds_;
+  next.outdoorLightThresholdPercent = static_cast<float>(threshold);
+  next.lightHoldPercent = static_cast<float>(hold);
+  next.lightingStartMinute = start;
+  next.lightingEndMinute = end;
+  if (!thresholdStoreSave(next)) {
+    server_.send(500, "application/json", "{\"ok\":false,\"message\":\"光照设置保存失败\"}");
+    return;
+  }
+  *thresholds_ = next;
+  server_.send(200, "application/json", "{\"ok\":true,\"message\":\"光照设置已保存\"}");
 }
 
 void NetworkPortal::sendTime() {

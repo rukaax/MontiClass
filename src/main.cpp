@@ -13,29 +13,26 @@
 #include <esp_log.h>
 #include <math.h>
 
-#include "SSD1306.h"
 #include "buzzer.h"
 #include "control.h"
 #include "environment_status.h"
 #include "fan.h"
 #include "lighting.h"
 #include "network_portal.h"
+#include "oled_controller.h"
 #include "rtc_clock.h"
 #include "sensors.h"
 #include "servo.h"
 #include "threshold_store.h"
 
 namespace {
-enum class Screen : uint8_t { Monitor, Settings };
-
 SensorManager sensors;
 NetworkPortal networkPortal;
 Thresholds thresholds;
-Screen screen = Screen::Monitor;
-uint8_t selectedThreshold = 0;
-bool editingThreshold = false;
-bool thresholdsDirty = false;
-bool settingsNetworkInfoVisible = false;
+bool automaticOutdoorDark = false;
+bool automaticPresenceRecent = true;
+bool presenceTrackingStarted = false;
+uint32_t lastPresenceDetectedMs = 0;
 
 // ---------------------------------------------------------------------------
 // 传感器采集所需的内部常量和换算函数
@@ -120,6 +117,9 @@ uint16_t led1Duty = 0;
 uint16_t led2Duty = 0;
 uint16_t led3Duty = 0;
 uint32_t lastLogMs = 0;
+constexpr uint16_t kAutomaticDutyStep =
+    (static_cast<uint32_t>(kPwmMaxDuty) + 50U) / 100U;
+constexpr uint16_t kAutomaticMaxDuty = kPwmMaxDuty;
 
 uint16_t dutyFromPercent(float brightnessPercent) {
   // 0..100% 表示允许亮度范围，100% 映射到上面的安全占空比，而不是 1023。
@@ -133,6 +133,21 @@ void writeDuty(uint8_t channel, uint16_t nextDuty, uint16_t& currentDuty) {
   if (nextDuty == currentDuty) return;
   ledcWrite(channel, nextDuty);
   currentDuty = nextDuty;
+}
+
+uint16_t adjustedAutomaticDuty(int8_t direction, uint16_t currentDuty) {
+  if (direction > 0) {
+    const uint32_t steppedDuty = currentDuty + kAutomaticDutyStep;
+    return static_cast<uint16_t>(steppedDuty < kAutomaticMaxDuty
+                                     ? steppedDuty
+                                     : kAutomaticMaxDuty);
+  }
+  if (direction < 0) {
+    return currentDuty > kAutomaticDutyStep
+               ? static_cast<uint16_t>(currentDuty - kAutomaticDutyStep)
+               : 0;
+  }
+  return currentDuty;
 }
 }  // namespace LightingHardware
 
@@ -148,9 +163,11 @@ constexpr mcpwm_generator_t kGeneratorA = MCPWM_GEN_A;
 constexpr mcpwm_generator_t kGeneratorB = MCPWM_GEN_B;
 constexpr uint32_t kPwmFrequencyHz = 20000;
 
-// main.cpp 每轮都会下发自动目标。5% 死区只用于避免目标轻微变化时反复重写
-// MCPWM；环境负荷如何计算、最低起转速度是多少仍由下面的主控制策略决定。
-constexpr uint8_t kSpeedDeadbandPercent = 5;
+// 自动运行时每 100ms 最多改变 1%，与 LED 一样在目标上下 2% 内保持。
+constexpr uint8_t kSpeedTolerancePercent = 2;
+constexpr uint8_t kSpeedStepPercent = 1;
+constexpr uint32_t kAutomaticStepIntervalMs = 100;
+constexpr uint8_t kMinimumRunningSpeedPercent = 40;
 
 bool ready = false;
 bool manual = false;
@@ -159,6 +176,7 @@ bool running = false;
 int8_t direction = 1;
 uint8_t speed = 0;
 uint32_t lastLogMs = 0;
+uint32_t lastAutomaticStepMs = 0;
 
 void applyPwm(int8_t nextDirection, uint8_t nextSpeed) {
   if (!ready) return;
@@ -182,8 +200,6 @@ void applyPwm(int8_t nextDirection, uint8_t nextSpeed) {
   direction = nextDirection;
   speed = nextSpeed;
   running = nextSpeed != 0;
-  Serial.printf("[FAN] pwm direction=%d speed=%u%% dutyA=%.0f dutyB=%.0f\r\n",
-                direction, speed, reverseDuty, forwardDuty);
 }
 }  // namespace FanHardware
 
@@ -234,12 +250,7 @@ void writeAngle(uint16_t angle) {
 constexpr float kAirLoadSpanAqi = 100.0f;
 constexpr float kTemperatureLoadSpanC = 6.0f;
 constexpr float kHumidityLoadSpanPercent = 20.0f;
-// ADC 光照欠缺负荷的自动调光最高只允许 50% 逻辑亮度；WebUI 手动模式不受此
-// 自动策略上限影响，但仍受 LightingHardware 的 PWM 电压上限约束。
-constexpr float kAutomaticLightingMaximumPercent = 50.0f;
-
-// 风扇需要至少 40% 才能可靠起转。100% 是硬件接口允许的最大占空比。
-constexpr uint8_t kFanMinimumRunningSpeedPercent = 40;
+// 风扇最高允许 100% 占空比；最低可靠起转速度由 FanHardware 统一定义。
 constexpr uint8_t kFanMaximumSpeedPercent = 100;
 
 // 舵机自动控制只有两个位置：正常时关闭到 0°，AQI、温度、湿度三项中至少
@@ -271,31 +282,27 @@ float normalizedOvershoot(float value, float threshold, float fullLoadSpan,
   return constrain(excess / fullLoadSpan, 0.0f, 1.0f);
 }
 
-float normalizedLightShortfall(float lightPercent, float thresholdPercent) {
-  // 光照使用下限阈值，方向与温湿度相反：达到阈值时负荷为 0，读数越接近
-  // 0% 负荷越接近 1。阈值为 0% 代表关闭自动照明，因此必须直接返回 0。
-  if (!isfinite(lightPercent) || !isfinite(thresholdPercent) ||
-      thresholdPercent <= 0.0f || lightPercent >= thresholdPercent) {
+float automaticLightLoad(float lightPercent, float holdPercent) {
+  // 保持率就是目标光照强度，单位与传感器光照率相同（0..100%）。直接使用
+  // 比例误差形成连续目标，不再用开/关状态机，避免 LED 反照造成整路闪烁。
+  if (!isfinite(lightPercent) || !isfinite(holdPercent) || holdPercent <= 0.0f) {
     return 0.0f;
   }
-  return constrain((thresholdPercent - lightPercent) / thresholdPercent, 0.0f, 1.0f);
+  return constrain((holdPercent - lightPercent) / holdPercent, 0.0f, 1.0f);
 }
 
 EnvironmentStatus evaluateEnvironment(const SensorData& data,
                                       const Thresholds& currentThresholds) {
   EnvironmentStatus status;
 
-  // 两路光敏共用一个下限阈值，但分别保留告警位和欠光负荷。这样 LED1 可以
-  // 跟随光敏1，而 LED2/LED3 可以共同跟随光敏2。
-  status.light1Alert = isBelowLowerLimit(data.light1Percent,
-                                         currentThresholds.lightPercent);
-  status.light2Alert = isBelowLowerLimit(data.light2Percent,
-                                         currentThresholds.lightPercent);
-  status.lightAlert = status.light1Alert || status.light2Alert;
-  status.light1Load = normalizedLightShortfall(data.light1Percent,
-                                                currentThresholds.lightPercent);
-  status.light2Load = normalizedLightShortfall(data.light2Percent,
-                                                currentThresholds.lightPercent);
+  // 光照不产生蜂鸣器告警；光敏1表示室内目标差值，光敏2表示室外欠光程度。
+  status.light1Alert = false;
+  status.light2Alert = false;
+  status.lightAlert = false;
+  status.light1Load = automaticLightLoad(data.light1Percent,
+                                         currentThresholds.lightHoldPercent);
+  status.light2Load = automaticLightLoad(
+      data.light2Percent, currentThresholds.outdoorLightThresholdPercent);
 
   // MQ135 预热结束前不产生 AQI 告警或风扇负荷。DHT11 只有本轮温湿度同时
   // 读取成功时 dhtValid 才为 true，避免使用上一次缓存值控制设备。
@@ -320,11 +327,51 @@ EnvironmentStatus evaluateEnvironment(const SensorData& data,
   return status;
 }
 
-float brightnessPercentFromLoad(float load) {
-  // 自动亮度保留浮点百分比并交给下方 LED 输出函数转换为受限 PWM。
-  // constrain 保证计算误差不会产生非法目标。
-  load = constrain(load, 0.0f, 1.0f);
-  return load * kAutomaticLightingMaximumPercent;
+int8_t automaticLightDirection(float currentPercent, float targetPercent) {
+  // 室内光照误差超过 2 个百分点才调整，目标上下 2% 内保持当前 PWM。
+  constexpr float kLightDeadbandPercent = 2.0f;
+  if (!isfinite(currentPercent) || !isfinite(targetPercent)) return 0;
+  if (targetPercent <= 0.0f) return -1;
+  const float error = targetPercent - currentPercent;
+  if (error > kLightDeadbandPercent) return 1;
+  if (error < -kLightDeadbandPercent) return -1;
+  return 0;
+}
+
+bool automaticLightingScheduleActive(const Thresholds& currentThresholds) {
+  RtcDateTime now;
+  if (!rtcClock.read(now)) return false;
+  const uint16_t minuteOfDay = static_cast<uint16_t>(now.hour * 60U + now.minute);
+  return lightingScheduleContainsMinute(currentThresholds, minuteOfDay);
+}
+
+bool updateOutdoorDarkState(float outdoorPercent, float thresholdPercent) {
+  constexpr float kOutdoorExitHysteresisPercent = 1.0f;
+  if (!isfinite(outdoorPercent) || !isfinite(thresholdPercent) ||
+      thresholdPercent <= 0.0f) {
+    automaticOutdoorDark = false;
+    return false;
+  }
+  if (!automaticOutdoorDark) {
+    automaticOutdoorDark = outdoorPercent < thresholdPercent;
+  } else {
+    const float exitThreshold =
+        constrain(thresholdPercent + kOutdoorExitHysteresisPercent, 0.0f, 100.0f);
+    if (outdoorPercent >= exitThreshold) automaticOutdoorDark = false;
+  }
+  return automaticOutdoorDark;
+}
+
+bool updatePresenceRecentState(bool presenceDetected) {
+  constexpr uint32_t kNoPresenceTurnOffMs = 60000;
+  const uint32_t now = millis();
+  if (!presenceTrackingStarted) {
+    presenceTrackingStarted = true;
+    lastPresenceDetectedMs = now;
+  }
+  if (presenceDetected) lastPresenceDetectedMs = now;
+  automaticPresenceRecent = now - lastPresenceDetectedMs < kNoPresenceTurnOffMs;
+  return automaticPresenceRecent;
 }
 
 uint8_t automaticFanSpeed(const EnvironmentStatus& status) {
@@ -343,8 +390,8 @@ uint8_t automaticFanSpeed(const EnvironmentStatus& status) {
   const float secondary = total - dominant;
   const float blendedLoad = constrain(dominant + secondary * 0.5f, 0.0f, 1.0f);
   const float adjustableRange = static_cast<float>(kFanMaximumSpeedPercent -
-                                                   kFanMinimumRunningSpeedPercent);
-  return static_cast<uint8_t>(kFanMinimumRunningSpeedPercent +
+                                                   FanHardware::kMinimumRunningSpeedPercent);
+  return static_cast<uint8_t>(FanHardware::kMinimumRunningSpeedPercent +
                               blendedLoad * adjustableRange + 0.5f);
 }
 
@@ -357,65 +404,36 @@ uint16_t automaticServoAngle(const EnvironmentStatus& status) {
   return exceededCount >= 2 ? kServoOpenAngle : kServoClosedAngle;
 }
 
-void applyAutomaticControl(const EnvironmentStatus& status) {
-  // LED1 对应光敏1；LED2、LED3 都对应光敏2。三个百分比在 main 中明确映射，
-  // LED 输出函数不读取传感器，也不需要知道每只灯安装在哪个区域。
-  const float led1Brightness = brightnessPercentFromLoad(status.light1Load);
-  const float led23Brightness = brightnessPercentFromLoad(status.light2Load);
-  lightingApplyAutomatic(led1Brightness, led23Brightness, led23Brightness);
+void applyAutomaticControl(const EnvironmentStatus& status, const SensorData& data,
+                           const Thresholds& currentThresholds,
+                           bool lightSampled) {
+  const bool presenceRecent = updatePresenceRecentState(data.presenceDetected);
+  // 每个新光照样本只生成一次“提高、降低、保持”命令，避免对旧数据重复推进 PWM。
+  if (lightSampled) {
+    if (!automaticLightingScheduleActive(currentThresholds) || !presenceRecent) {
+      automaticOutdoorDark = false;
+      lightingTurnOffAutomatic();
+    } else {
+      const bool outdoorIsDark = updateOutdoorDarkState(
+          data.light2Percent, currentThresholds.outdoorLightThresholdPercent);
+      if (!outdoorIsDark) {
+        lightingTurnOffAutomatic();
+      } else {
+        const int8_t direction = automaticLightDirection(
+            data.light1Percent, currentThresholds.lightHoldPercent);
+        lightingAdjustAutomatic(direction);
+      }
+    }
+  }
 
-  // 自动风扇固定使用正转。下方风扇输出函数在手动模式会忽略自动目标，并负责 PWM
-  // 写入死区；转速如何由三个传感器负荷得出则完全由本文件负责。
-  fanApplyAutomatic(1, automaticFanSpeed(status));
+  // 自动风扇固定使用正转；连续 60 秒无人时目标直接归零。手动模式会忽略
+  // 此处目标，重新检测到人后再按温湿度和 AQI 负荷恢复自动转速。
+  fanApplyAutomatic(1, presenceRecent ? automaticFanSpeed(status) : 0);
 
   // 下方舵机输出函数同样只执行最终角度，并在 WebUI 手动模式下忽略自动目标。
   servoApplyAutomaticAngle(automaticServoAngle(status));
 }
 
-// 设置页的编辑判断留在 main：这里决定“旋转”是在移动光标还是修改阈值；
-// 阈值的保存细节则封装在 threshold_store 模块中。
-void adjustSelectedThreshold(int direction) {
-  switch (selectedThreshold) {
-    case 0:
-      thresholds.lightPercent = constrain(thresholds.lightPercent + direction, 0.0f, 100.0f);
-      break;
-    case 1:
-      thresholds.mq135Aqi = constrain(thresholds.mq135Aqi + direction * 5.0f, 0.0f, 500.0f);
-      break;
-    case 2:
-      thresholds.temperatureC = constrain(thresholds.temperatureC + direction * 0.5f, 0.0f, 60.0f);
-      break;
-    case 3:
-      thresholds.humidityPercent = constrain(thresholds.humidityPercent + direction, 0.0f, 100.0f);
-      break;
-  }
-  thresholdsDirty = true;
-}
-
-void updateSettings(int direction) {
-  if (editingThreshold) {
-    if (direction != 0) adjustSelectedThreshold(direction);
-    if (controlWasShortPress()) {
-      if (thresholdsDirty && thresholdStoreSave(thresholds)) thresholdsDirty = false;
-      editingThreshold = false;
-    }
-    return;
-  }
-
-  if (direction > 0) {
-    if (settingsNetworkInfoVisible) settingsNetworkInfoVisible = false;
-    else if (selectedThreshold > 0) --selectedThreshold;
-  } else if (direction < 0) {
-    if (selectedThreshold < 3) ++selectedThreshold;
-    else settingsNetworkInfoVisible = true;
-  }
-  // 网络信息页只读；显示它时短按不进入任何编辑状态。
-  if (controlWasShortPress() && !settingsNetworkInfoVisible) editingThreshold = true;
-  if (controlWasLongPress()) {
-    screen = Screen::Monitor;
-    settingsNetworkInfoVisible = false;
-  }
-}
 }  // namespace
 
 // ===========================================================================
@@ -451,23 +469,30 @@ bool SensorManager::update() {
   // 让 WebUI 的人体存在状态能快速响应。
   data_.presenceDetected = digitalRead(Pins::kLd2402) == HIGH;
 
-  // DHT11 不适合高频读取，本项目统一每 2 秒更新一次模拟量和温湿度。
-  // sampledOnce_ 让设备启动后的第一轮立即采样，而不是先空等 2 秒。
-  if (sampledOnce_ && now - lastSampleMs_ < kSampleIntervalMs) return false;
+  // 两路光敏每 100ms 独立采样一次，为 LED 增量闭环提供及时反馈。
+  bool lightSampled = false;
+  if (!lightSampledOnce_ || now - lastLightSampleMs_ >= kLightSampleIntervalMs) {
+    lightSampledOnce_ = true;
+    lastLightSampleMs_ = now;
+    data_.light1Raw = readAveragedAdc(Pins::kLight1);
+    data_.light2Raw = readAveragedAdc(Pins::kLight2);
+    data_.light1Percent = SensorHardware::lightPercentFromRaw(
+        data_.light1Raw, SensorHardware::kLight1DarkIsHigh);
+    data_.light2Percent = SensorHardware::lightPercentFromRaw(
+        data_.light2Raw, SensorHardware::kLight2DarkIsHigh);
+    lightSampled = true;
+  }
+
+  // DHT11 不适合高频读取，MQ135 和温湿度继续每 2 秒更新一次。
+  if (sampledOnce_ && now - lastSampleMs_ < kEnvironmentSampleIntervalMs) {
+    return lightSampled;
+  }
   sampledOnce_ = true;
   lastSampleMs_ = now;
 
-  // 保存原始 ADC，便于现场判断模块是否接反、悬空或饱和；同时读取 MQ135
-  // 校准后的近似毫伏值供 WebUI 排查接线，但自动控制使用下面的相对 AQI。
-  data_.light1Raw = readAveragedAdc(Pins::kLight1);
-  data_.light2Raw = readAveragedAdc(Pins::kLight2);
+  // 保存 MQ135 原始 ADC 和校准毫伏值，供相对 AQI 与 WebUI 诊断使用。
   data_.mq135Raw = readAveragedAdc(Pins::kMq135);
   data_.mq135MilliVolts = readAveragedMillivolts(Pins::kMq135);
-
-  data_.light1Percent = SensorHardware::lightPercentFromRaw(
-      data_.light1Raw, SensorHardware::kLight1DarkIsHigh);
-  data_.light2Percent = SensorHardware::lightPercentFromRaw(
-      data_.light2Raw, SensorHardware::kLight2DarkIsHigh);
 
   // MQ135 预热共 3 分钟，只在最后 60 秒累计空气基线。这样可避开冷启动变化
   // 最大的阶段，又能用多个样本平均降低单次 ADC 噪声。
@@ -502,7 +527,7 @@ bool SensorManager::update() {
     data_.temperatureC = temperature;
     data_.humidityPercent = humidity;
   }
-  return true;
+  return lightSampled;
 }
 
 const SensorData& SensorManager::data() const {
@@ -577,32 +602,39 @@ void lightingInit() {
                 LightingHardware::kLedSupplyMillivolts);
 }
 
-void lightingApplyAutomatic(float led1Percent, float led2Percent, float led3Percent) {
-  // 手动模式下忽略 main.cpp 每轮下发的自动值，才能让 WebUI 滑块保持稳定。
+void lightingAdjustAutomatic(int8_t direction) {
+  // 手动模式下忽略自动增量命令，才能让 WebUI 滑块保持稳定。
   if (!LightingHardware::ready || LightingHardware::manual) return;
-  if (!isfinite(led1Percent) || !isfinite(led2Percent) || !isfinite(led3Percent) ||
-      led1Percent < 0.0f || led1Percent > 100.0f ||
-      led2Percent < 0.0f || led2Percent > 100.0f ||
-      led3Percent < 0.0f || led3Percent > 100.0f) {
-    return;
-  }
+  if (direction < -1 || direction > 1) return;
 
+  const uint16_t synchronizedDuty = LightingHardware::adjustedAutomaticDuty(
+      direction, LightingHardware::led2Duty);
   LightingHardware::writeDuty(
       LightingHardware::kLed1Channel,
-      LightingHardware::dutyFromPercent(led1Percent), LightingHardware::led1Duty);
+      synchronizedDuty, LightingHardware::led1Duty);
   LightingHardware::writeDuty(
       LightingHardware::kLed2Channel,
-      LightingHardware::dutyFromPercent(led2Percent), LightingHardware::led2Duty);
+      synchronizedDuty, LightingHardware::led2Duty);
   LightingHardware::writeDuty(
       LightingHardware::kLed3Channel,
-      LightingHardware::dutyFromPercent(led3Percent), LightingHardware::led3Duty);
+      synchronizedDuty, LightingHardware::led3Duty);
 
   const uint32_t now = millis();
   if (now - LightingHardware::lastLogMs >= 2000) {
-    Serial.printf("[LIGHT] automatic LED1=%.1f%% LED2=%.1f%% LED3=%.1f%%\r\n",
-                  led1Percent, led2Percent, led3Percent);
+    Serial.printf("[LIGHT] automatic dir=%d synchronizedDuty=%u\r\n",
+                  direction, synchronizedDuty);
     LightingHardware::lastLogMs = now;
   }
+}
+
+void lightingTurnOffAutomatic() {
+  if (!LightingHardware::ready || LightingHardware::manual) return;
+  LightingHardware::writeDuty(
+      LightingHardware::kLed1Channel, 0, LightingHardware::led1Duty);
+  LightingHardware::writeDuty(
+      LightingHardware::kLed2Channel, 0, LightingHardware::led2Duty);
+  LightingHardware::writeDuty(
+      LightingHardware::kLed3Channel, 0, LightingHardware::led3Duty);
 }
 
 bool lightingSetManual(uint8_t led1Percent, uint8_t led2Percent,
@@ -638,6 +670,10 @@ void lightingResumeAutomatic() {
 bool lightingReady() { return LightingHardware::ready; }
 
 bool lightingManualMode() { return LightingHardware::manual; }
+
+bool lightingOutdoorDark() { return automaticOutdoorDark; }
+
+bool lightingPresenceRecent() { return automaticPresenceRecent; }
 
 uint8_t lightingBrightnessPercent(uint8_t ledIndex) {
   uint16_t duty = 0;
@@ -686,6 +722,9 @@ void fanInit() {
 void fanApplyAutomatic(int8_t nextDirection, uint8_t desiredSpeed) {
   if (!FanHardware::ready || FanHardware::manual) return;
   if ((nextDirection != -1 && nextDirection != 1) || desiredSpeed > 100) return;
+  if (desiredSpeed != 0 && desiredSpeed < FanHardware::kMinimumRunningSpeedPercent) {
+    desiredSpeed = FanHardware::kMinimumRunningSpeedPercent;
+  }
 
   const uint32_t now = millis();
   if (now - FanHardware::lastLogMs >= 2000) {
@@ -695,20 +734,40 @@ void fanApplyAutomatic(int8_t nextDirection, uint8_t desiredSpeed) {
     FanHardware::lastLogMs = now;
   }
 
-  // 起停和换向立即执行；同方向运行时变化不足 5% 就保持当前值，避免传感器
-  // 在阈值附近轻微抖动时风扇忽快忽慢。恢复自动时会强制写入一次。
-  const bool crossesStopBoundary =
-      (desiredSpeed == 0) != (FanHardware::speed == 0);
-  const bool changesDirection =
-      desiredSpeed != 0 && nextDirection != FanHardware::direction;
+  // 停机立即执行；启动和换向先进入 40% 可靠起转区，避免低占空比堵转。
+  if (desiredSpeed == 0) {
+    if (FanHardware::speed != 0 || FanHardware::automaticNeedsApply) {
+      FanHardware::applyPwm(nextDirection, 0);
+    }
+    FanHardware::automaticNeedsApply = false;
+    return;
+  }
+  if (FanHardware::speed < FanHardware::kMinimumRunningSpeedPercent ||
+      nextDirection != FanHardware::direction) {
+    FanHardware::applyPwm(nextDirection, FanHardware::kMinimumRunningSpeedPercent);
+    FanHardware::lastAutomaticStepMs = now;
+    FanHardware::automaticNeedsApply = false;
+    return;
+  }
+
   const uint8_t delta = desiredSpeed > FanHardware::speed
                             ? desiredSpeed - FanHardware::speed
                             : FanHardware::speed - desiredSpeed;
-  if (FanHardware::automaticNeedsApply || crossesStopBoundary || changesDirection ||
-      delta >= FanHardware::kSpeedDeadbandPercent) {
-    FanHardware::applyPwm(nextDirection, desiredSpeed);
+  if (delta <= FanHardware::kSpeedTolerancePercent) {
     FanHardware::automaticNeedsApply = false;
+    return;
   }
+  if (!FanHardware::automaticNeedsApply &&
+      now - FanHardware::lastAutomaticStepMs < FanHardware::kAutomaticStepIntervalMs) {
+    return;
+  }
+
+  const uint8_t nextSpeed = desiredSpeed > FanHardware::speed
+                                ? FanHardware::speed + FanHardware::kSpeedStepPercent
+                                : FanHardware::speed - FanHardware::kSpeedStepPercent;
+  FanHardware::applyPwm(nextDirection, nextSpeed);
+  FanHardware::lastAutomaticStepMs = now;
+  FanHardware::automaticNeedsApply = false;
 }
 
 bool fanSetManual(int8_t nextDirection, uint8_t speedPercent) {
@@ -816,8 +875,7 @@ void setup() {
   // 先从 NVS 恢复阈值，再初始化 OLED。这样第一张正式监测画面使用的就是上次
   // 保存的阈值，而不是短暂显示默认值后再跳变。
   thresholdStoreBegin(thresholds);
-  oledInit();
-  drawBootScreen();
+  OledController::begin();
 
   // RTC 使用独立 I2C 总线。即使 RTC 不存在，内部错误状态也不会阻止后续
   // PWM、网络和传感器初始化。
@@ -833,6 +891,7 @@ void setup() {
   // --------------------------- 网络、输入和传感器 ---------------------------
   // 网络模块负责 Wi-Fi、WebUI 和数据上报；编码器模块负责本地旋钮。传感器
   // begin() 最后配置 ADC、LD2402 和 DHT11，并开始 MQ135 的三分钟预热计时。
+  networkPortal.setThresholds(thresholds);
   networkPortal.begin();
   controlInit();
   sensors.begin();
@@ -844,7 +903,7 @@ void setup() {
 void loop() {
   // 第一步：传感器读取函数只完成采集，network_portal.cpp 只维护网络通信，
   // 二者都不在这一阶段判断阈值或决定执行器目标。
-  sensors.update();
+  const bool lightSampled = sensors.update();
   controlUpdate();
   networkPortal.update(sensors.data());
 
@@ -855,8 +914,6 @@ void loop() {
   // 第三步：把五个独立告警编码成 bit mask。buzzer.cpp 只负责启用状态、
   // 单次鸣叫时序和 NVS，不再判断任何传感器数值。
   const uint8_t environmentAlertMask =
-      (environmentStatus.light1Alert ? 0x01 : 0x00) |
-      (environmentStatus.light2Alert ? 0x02 : 0x00) |
       (environmentStatus.airAlert ? 0x04 : 0x00) |
       (environmentStatus.temperatureAlert ? 0x08 : 0x00) |
       (environmentStatus.humidityAlert ? 0x10 : 0x00);
@@ -864,41 +921,10 @@ void loop() {
 
   // 第四步：在 main.cpp 计算 LED 亮度、风扇转速和舵机角度，再把最终目标
   // 下发给各自驱动。驱动内部的手动覆盖会决定是否接受本轮自动目标。
-  applyAutomaticControl(environmentStatus);
+  applyAutomaticControl(environmentStatus, sensors.data(), thresholds, lightSampled);
 
-  // 无论配网前用户停在何种设置状态，联网成功后都回到实时监测页。
-  if (networkPortal.takeConnectionSucceeded()) {
-    screen = Screen::Monitor;
-    editingThreshold = false;
-    settingsNetworkInfoVisible = false;
-  }
-
-  // 首次配网与连接过程由网络模块接管 OLED；连接成功后自动恢复监测页面。
-  if (networkPortal.isShowingNetworkScreen()) {
-    delay(15);
-    return;
-  }
-
-  const int rawDelta = controlReadEncoderDelta();
-  const int direction = rawDelta > 0 ? 1 : (rawDelta < 0 ? -1 : 0);
-  if (screen == Screen::Monitor) {
-    if (controlWasLongPress()) {
-      screen = Screen::Settings;
-      selectedThreshold = 0;
-      editingThreshold = false;
-      settingsNetworkInfoVisible = false;
-    }
-    // OLED 只消费 main.cpp 已算好的状态，不在显示层重复比较阈值。
-    drawMonitor(sensors.data(), environmentStatus);
-  } else {
-    const bool stationConnected = networkPortal.isStationConnected();
-    updateSettings(direction);
-    const String ipAddress = networkPortal.stationIpAddress();
-    const ReportUploadStatus reportStatus = networkPortal.reportUploadStatus();
-    drawSettings(thresholds, selectedThreshold, editingThreshold,
-                 ipAddress.c_str(), stationConnected, reportStatus,
-                 settingsNetworkInfoVisible);
-  }
+  // OLED 页面状态、旋钮交互和绘制调度全部由独立显示控制模块负责。
+  OledController::update(thresholds, sensors.data(), environmentStatus, networkPortal);
 
   delay(15);
 }

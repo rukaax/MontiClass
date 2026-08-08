@@ -39,14 +39,15 @@ class SensorManager {
  public:
   // 配置 ADC、启动 DHT 库，并开始 MQ135 的预热计时。
   void begin();
-  // 每 2 秒采样一次；本轮发生采样时返回 true。
+  // 光敏每 100ms 采样；返回值表示本轮是否得到新的光照样本。
   bool update();
   // 返回只读引用，避免在每帧 OLED 刷新时复制整个数据结构。
   const SensorData& data() const;
 
  private:
-  // 采样周期与 DHT11 的限制兼容，也使串口日志便于阅读。
-  static constexpr uint32_t kSampleIntervalMs = 2000;
+  // 光敏闭环需要较快采样，DHT11 和 MQ135 仍按较慢周期更新。
+  static constexpr uint32_t kLightSampleIntervalMs = 100;
+  static constexpr uint32_t kEnvironmentSampleIntervalMs = 2000;
   // 每次冷启动至少等待 3 分钟再显示响应强度。新传感器首次使用仍应按
   // 所购模块资料进行更长时间老化；真实 ppm 还必须单独标定 R0 和气体曲线。
   static constexpr uint32_t kMq135WarmupMs = 180000;
@@ -54,10 +55,12 @@ class SensorManager {
 
   DHT dht_{Pins::kDht11, DHT11};
   SensorData data_{};
+  uint32_t lastLightSampleMs_ = 0;
   uint32_t lastSampleMs_ = 0;
   uint32_t mq135StartedMs_ = 0;
   uint32_t mq135BaselineSum_ = 0;
   uint16_t mq135BaselineSamples_ = 0;
+  bool lightSampledOnce_ = false;
   bool sampledOnce_ = false;
 
   static uint16_t readAveragedAdc(uint8_t pin);

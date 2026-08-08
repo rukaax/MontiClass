@@ -15,7 +15,7 @@ constexpr uint8_t kFanIn2 = 42;
 }  // namespace Pins
 
 void fanInit();
-// main.cpp 已经算出方向和转速；本函数只在非手动模式下执行该目标。
+// 自动模式运行中每100ms向目标调整1%，目标上下2%内保持；起停单独处理。
 void fanApplyAutomatic(int8_t direction, uint8_t speedPercent);
 bool fanSetManual(int8_t direction, uint8_t speedPercent);
 void fanResumeAutomatic();

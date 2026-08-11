@@ -62,21 +62,36 @@ const char kWebPage[] PROGMEM = R"HTML(
   <title>教室环境监测器</title
   ><style>
     body {
-      max-width: 680px;
+      max-width: 1400px;
       margin: 24px auto;
       padding: 0 16px;
       font: 16px system-ui;
       color: #172033;
       background: #f5f7fb;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 16px;
+      align-items: stretch;
     }
     h1 {
+      grid-column: 1 / -1;
+      margin: 0;
       font-size: 1.6rem;
     }
+    body > #network,
+    body > .network-details,
+    body > p {
+      grid-column: 1 / -1;
+    }
+    body > #network {
+      margin: -8px 0 0;
+    }
     .card {
+      min-width: 0;
       background: #fff;
       border-radius: 12px;
       padding: 16px;
-      margin: 12px 0;
+      margin: 0;
       box-shadow: 0 2px 10px #0001;
     }
     .grid {
@@ -88,7 +103,7 @@ const char kWebPage[] PROGMEM = R"HTML(
       display: grid;
       grid-template-columns: repeat(3, 1fr);
       gap: 8px;
-      margin: 8px 0 16px;
+      margin: -8px 0 0;
     }
     .network-details div {
       min-width: 0;
@@ -129,9 +144,15 @@ const char kWebPage[] PROGMEM = R"HTML(
       color: #596579;
       font-size: 0.9rem;
     }
-    @media (max-width: 520px) {
+    @media (max-width: 720px) {
+      body,
+      .grid,
       .network-details {
         grid-template-columns: 1fr;
+      }
+      body {
+        margin: 16px auto;
+        gap: 12px;
       }
     }
   </style>
@@ -174,7 +195,7 @@ const char kWebPage[] PROGMEM = R"HTML(
       </div>
     </section>
     <section class="card">
-      <h2>夜间照明</h2>
+      <h2>自动照明与无人关闭</h2>
       <div class="grid">
         <div>室内光照 1<div id="lightingLight1" class="value">--</div></div>
         <div>室外光照 2<div id="lightingLight2" class="value">--</div></div>
@@ -192,7 +213,11 @@ const char kWebPage[] PROGMEM = R"HTML(
           <label>自动调光开始<input id="lightingStart" type="time" step="60" required /></label>
           <label>自动调光结束<input id="lightingEnd" type="time" step="60" required /></label>
         </div>
-        <button type="submit">保存照明设置</button>
+        <div class="grid">
+          <label>无人关灯延时（秒）<input id="lightingNoPresenceTimeout" type="number" min="1" max="86400" step="1" required /></label>
+          <label>无人关风扇延时（秒）<input id="fanNoPresenceTimeout" type="number" min="1" max="86400" step="1" required /></label>
+        </div>
+        <button type="submit">保存自动控制设置</button>
       </form>
       <p id="lightingConfigStatus" class="muted">读取中…</p>
     </section>
@@ -288,6 +313,8 @@ const char kWebPage[] PROGMEM = R"HTML(
           document.getElementById("lightHold").value = s.hold;
           document.getElementById("lightingStart").value = s.start;
           document.getElementById("lightingEnd").value = s.end;
+          document.getElementById("lightingNoPresenceTimeout").value = s.lightingTimeout;
+          document.getElementById("fanNoPresenceTimeout").value = s.fanTimeout;
         }
         document.getElementById("lightingLight1").textContent = s.light1 + "%";
         document.getElementById("lightingLight2").textContent = s.light2 + "%";
@@ -302,7 +329,7 @@ const char kWebPage[] PROGMEM = R"HTML(
               ? "RTC 时间无效，自动照明已关闭"
               : s.scheduleActive
                 ? !s.presenceRecent
-                  ? "连续 1 分钟无人，照明已关闭"
+                  ? "连续 " + s.lightingTimeout + " 秒无人，照明已关闭"
                   : s.outdoorDark
                     ? "室外低于阈值，正在调节室内光照"
                     : "室外未低于阈值，照明已关闭"
@@ -331,18 +358,20 @@ const char kWebPage[] PROGMEM = R"HTML(
               hold: document.getElementById("lightHold").value,
               start: document.getElementById("lightingStart").value,
               end: document.getElementById("lightingEnd").value,
+              lighting_timeout: document.getElementById("lightingNoPresenceTimeout").value,
+              fan_timeout: document.getElementById("fanNoPresenceTimeout").value,
             }),
           });
           const j = await r.json();
           if (!r.ok || !j.ok) throw new Error(j.message || r.status);
           lightingConfigDirty = false;
-          status.textContent = j.message || "照明设置已保存";
+          status.textContent = j.message || "自动控制设置已保存";
           await refreshLightingConfig(true);
         } catch (e) {
           status.textContent = "保存失败：" + (e.message || "请求错误");
         }
       }
-      ["outdoorLightThreshold", "lightHold", "lightingStart", "lightingEnd"].forEach((id) => {
+      ["outdoorLightThreshold", "lightHold", "lightingStart", "lightingEnd", "lightingNoPresenceTimeout", "fanNoPresenceTimeout"].forEach((id) => {
         document.getElementById(id).addEventListener("input", () => {
           lightingConfigDirty = true;
         });
@@ -750,7 +779,7 @@ const char kHomeTimeWidgetV2[] PROGMEM = R"HTML(
   .rtc-card button:disabled {
     opacity: 0.6;
   }
-  @media (max-width: 520px) {
+  @media (max-width: 720px) {
     .rtc-card .rtc-fields {
       grid-template-columns: 1fr;
     }
@@ -822,18 +851,23 @@ const char kActuatorPageV5[] PROGMEM = R"HTML(
   ><style>
 
  body {
-      max-width: 600px;
+      max-width: 1200px;
       margin: 24px auto;
       padding: 0 16px;
       font: 16px system-ui;
       color: #172033;
       background: #f5f7fb;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 16px;
+      align-items: stretch;
     }
     .card {
+      min-width: 0;
       background: #fff;
       border-radius: 12px;
       padding: 20px;
-      margin-bottom: 14px;
+      margin: 0;
       box-shadow: 0 2px 12px #0001;
     }
     h1,
@@ -968,7 +1002,12 @@ const char kActuatorPageV5[] PROGMEM = R"HTML(
     .status {
       min-height: 24px;
     }
-    @media (max-width: 420px) {
+    @media (max-width: 720px) {
+      body {
+        grid-template-columns: 1fr;
+        margin: 16px auto;
+        gap: 12px;
+      }
       .number,
       .fan-actions,
       .light-row {
@@ -1656,12 +1695,14 @@ void NetworkPortal::sendLightingConfig() {
       rtcValid && lightingScheduleContainsMinute(thresholds, minuteOfDay);
   const bool outdoorDark = lightingOutdoorDark();
   const bool presenceRecent = lightingPresenceRecent();
-  char response[352];
+  char response[448];
   snprintf(response, sizeof(response),
-           "{\"light1\":%.0f,\"light2\":%.0f,\"threshold\":%.0f,\"hold\":%.0f,\"start\":\"%s\",\"end\":\"%s\",\"automatic\":%s,\"rtcValid\":%s,\"scheduleActive\":%s,\"outdoorDark\":%s,\"presenceRecent\":%s}",
+           "{\"light1\":%.0f,\"light2\":%.0f,\"threshold\":%.0f,\"hold\":%.0f,\"start\":\"%s\",\"end\":\"%s\",\"fanTimeout\":%u,\"lightingTimeout\":%u,\"automatic\":%s,\"rtcValid\":%s,\"scheduleActive\":%s,\"outdoorDark\":%s,\"presenceRecent\":%s}",
            data.light1Percent, data.light2Percent,
            thresholds.outdoorLightThresholdPercent,
            thresholds.lightHoldPercent, start, end,
+           static_cast<unsigned>(thresholds.fanNoPresenceTimeoutSeconds),
+           static_cast<unsigned>(thresholds.lightingNoPresenceTimeoutSeconds),
            lightingManualMode() ? "false" : "true",
            rtcValid ? "true" : "false", scheduleActive ? "true" : "false",
            outdoorDark ? "true" : "false", presenceRecent ? "true" : "false");
@@ -1676,8 +1717,9 @@ void NetworkPortal::receiveLightingConfig() {
     return;
   }
   if (!server_.hasArg("threshold") || !server_.hasArg("hold") ||
-      !server_.hasArg("start") || !server_.hasArg("end")) {
-    server_.send(400, "application/json", "{\"ok\":false,\"message\":\"照明设置不完整\"}");
+      !server_.hasArg("start") || !server_.hasArg("end") ||
+      !server_.hasArg("fan_timeout") || !server_.hasArg("lighting_timeout")) {
+    server_.send(400, "application/json", "{\"ok\":false,\"message\":\"自动控制设置不完整\"}");
     return;
   }
   const int threshold = server_.arg("threshold").toInt();
@@ -1688,6 +1730,16 @@ void NetworkPortal::receiveLightingConfig() {
   }
   if (hold < 0 || hold > 100) {
     server_.send(400, "application/json", "{\"ok\":false,\"message\":\"光照保持率必须在0到100之间\"}");
+    return;
+  }
+  const long fanTimeout = server_.arg("fan_timeout").toInt();
+  const long lightingTimeout = server_.arg("lighting_timeout").toInt();
+  if (fanTimeout < 1 || fanTimeout > 86400) {
+    server_.send(400, "application/json", "{\"ok\":false,\"message\":\"无人关风扇延时必须在1到86400秒之间\"}");
+    return;
+  }
+  if (lightingTimeout < 1 || lightingTimeout > 86400) {
+    server_.send(400, "application/json", "{\"ok\":false,\"message\":\"无人关灯延时必须在1到86400秒之间\"}");
     return;
   }
   uint16_t start = 0;
@@ -1702,12 +1754,14 @@ void NetworkPortal::receiveLightingConfig() {
   next.lightHoldPercent = static_cast<float>(hold);
   next.lightingStartMinute = start;
   next.lightingEndMinute = end;
+  next.fanNoPresenceTimeoutSeconds = static_cast<uint32_t>(fanTimeout);
+  next.lightingNoPresenceTimeoutSeconds = static_cast<uint32_t>(lightingTimeout);
   if (!thresholdStoreSave(next)) {
-    server_.send(500, "application/json", "{\"ok\":false,\"message\":\"光照设置保存失败\"}");
+    server_.send(500, "application/json", "{\"ok\":false,\"message\":\"自动控制设置保存失败\"}");
     return;
   }
   *thresholds_ = next;
-  server_.send(200, "application/json", "{\"ok\":true,\"message\":\"光照设置已保存\"}");
+  server_.send(200, "application/json", "{\"ok\":true,\"message\":\"自动控制设置已保存\"}");
 }
 
 // GET /api/time - 返回 RTC 当前时间、NTP 服务器和同步状态。

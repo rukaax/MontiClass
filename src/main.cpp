@@ -31,6 +31,7 @@ NetworkPortal networkPortal;
 Thresholds thresholds;
 bool automaticOutdoorDark = false;
 bool automaticPresenceRecent = true;
+bool automaticFanPresenceRecent = true;
 bool presenceTrackingStarted = false;
 uint32_t lastPresenceDetectedMs = 0;
 
@@ -213,6 +214,9 @@ constexpr mcpwm_generator_t kGenerator = MCPWM_GEN_A;
 constexpr uint32_t kPwmFrequencyHz = 50;
 constexpr uint16_t kMinPulseUs = 500;
 constexpr uint16_t kMaxPulseUs = 2500;
+// 舵机安装方向与逻辑方向相反时，通过交换逻辑角度到 PWM 端点来修正；
+// WebUI/OLED 仍显示逻辑角度，不影响自动开窗的 0°/180°语义。
+constexpr bool kReverseDirection = true;
 
 bool ready = false;
 bool manual = false;
@@ -224,10 +228,12 @@ void writeAngle(uint16_t angle) {
   angle = constrain(angle, static_cast<uint16_t>(0), static_cast<uint16_t>(180));
 
   // SG90 用 20ms 周期内的高电平脉宽表示角度。本项目把 0..180°线性映射到
-  // 500..2500us。乘法使用 uint32_t，避免 16 位中间结果溢出。
+  // 500..2500us；安装方向反向时先交换逻辑角度。乘法使用 uint32_t，避免
+  // 16 位中间结果溢出。
+  const uint16_t outputAngle = kReverseDirection ? 180U - angle : angle;
   const uint16_t pulseUs = static_cast<uint16_t>(
       kMinPulseUs +
-      (static_cast<uint32_t>(kMaxPulseUs - kMinPulseUs) * angle) / 180U);
+      (static_cast<uint32_t>(kMaxPulseUs - kMinPulseUs) * outputAngle) / 180U);
   const esp_err_t result = mcpwm_set_duty_in_us(kUnit, kTimer, kGenerator, pulseUs);
   if (result != ESP_OK) {
     Serial.printf("[SERVO] PWM write failed angle=%u pulse=%uus err=%d\r\n",
@@ -366,17 +372,21 @@ bool updateOutdoorDarkState(float outdoorPercent, float thresholdPercent) {
   return automaticOutdoorDark;
 }
 
-// 维护“最近 60 秒内是否检测到人体”的状态，供节能策略使用。
-bool updatePresenceRecentState(bool presenceDetected) {
-  constexpr uint32_t kNoPresenceTurnOffMs = 60000;
+// 按用户分别设置的延时维护灯光和风扇的“最近有人”状态。
+void updatePresenceRecentState(bool presenceDetected,
+                               const Thresholds& currentThresholds) {
   const uint32_t now = millis();
   if (!presenceTrackingStarted) {
     presenceTrackingStarted = true;
     lastPresenceDetectedMs = now;
   }
   if (presenceDetected) lastPresenceDetectedMs = now;
-  automaticPresenceRecent = now - lastPresenceDetectedMs < kNoPresenceTurnOffMs;
-  return automaticPresenceRecent;
+  const uint32_t fanTimeoutMs = currentThresholds.fanNoPresenceTimeoutSeconds * 1000UL;
+  const uint32_t lightingTimeoutMs =
+      currentThresholds.lightingNoPresenceTimeoutSeconds * 1000UL;
+  const uint32_t elapsed = now - lastPresenceDetectedMs;
+  automaticFanPresenceRecent = elapsed < fanTimeoutMs;
+  automaticPresenceRecent = elapsed < lightingTimeoutMs;
 }
 
 // 依据 AQI/温度/湿度负荷合成一个 0..100% 的自动转速目标。
@@ -415,10 +425,12 @@ uint16_t automaticServoAngle(const EnvironmentStatus& status) {
 void applyAutomaticControl(const EnvironmentStatus& status, const SensorData& data,
                            const Thresholds& currentThresholds,
                            bool lightSampled) {
-  const bool presenceRecent = updatePresenceRecentState(data.presenceDetected);
+  updatePresenceRecentState(data.presenceDetected, currentThresholds);
+  const bool lightingPresenceRecentState = automaticPresenceRecent;
+  const bool fanPresenceRecentState = automaticFanPresenceRecent;
   // 每个新光照样本只生成一次“提高、降低、保持”命令，避免对旧数据重复推进 PWM。
   if (lightSampled) {
-    if (!automaticLightingScheduleActive(currentThresholds) || !presenceRecent) {
+    if (!automaticLightingScheduleActive(currentThresholds) || !lightingPresenceRecentState) {
       automaticOutdoorDark = false;
       lightingTurnOffAutomatic();
     } else {
@@ -434,9 +446,9 @@ void applyAutomaticControl(const EnvironmentStatus& status, const SensorData& da
     }
   }
 
-  // 自动风扇固定使用正转；连续 60 秒无人时目标直接归零。手动模式会忽略
+  // 自动风扇固定使用正转；达到用户设置的无人延时后目标直接归零。手动模式会忽略
   // 此处目标，重新检测到人后再按温湿度和 AQI 负荷恢复自动转速。
-  fanApplyAutomatic(1, presenceRecent ? automaticFanSpeed(status) : 0);
+  fanApplyAutomatic(1, fanPresenceRecentState ? automaticFanSpeed(status) : 0);
 
   // 下方舵机输出函数同样只执行最终角度，并在 WebUI 手动模式下忽略自动目标。
   servoApplyAutomaticAngle(automaticServoAngle(status));
@@ -837,9 +849,10 @@ void servoInit() {
   }
   ServoHardware::ready = true;
   ServoHardware::writeAngle(0);
-  Serial.printf("[SERVO] initialized gpio=%u MCPWM=0A pwm=%uHz pulse=500..2500us range=0..180deg\r\n",
+  Serial.printf("[SERVO] initialized gpio=%u MCPWM=0A pwm=%uHz pulse=500..2500us range=0..180deg reversed=%s\r\n",
                 Pins::kServo,
-                static_cast<unsigned int>(ServoHardware::kPwmFrequencyHz));
+                static_cast<unsigned int>(ServoHardware::kPwmFrequencyHz),
+                ServoHardware::kReverseDirection ? "yes" : "no");
 }
 
 // 自动模式下把舵机转到指定角度；同角度不重复写寄存器。

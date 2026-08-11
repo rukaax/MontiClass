@@ -13,6 +13,8 @@ struct Thresholds {
   float humidityPercent = 60.0f;
   uint16_t lightingStartMinute = 18U * 60U;  // 自动调光开始时间，按当天分钟计
   uint16_t lightingEndMinute = 6U * 60U;     // 自动调光结束时间，支持跨午夜
+  uint32_t fanNoPresenceTimeoutSeconds = 60U;      // 无人后自动关闭风扇的延时
+  uint32_t lightingNoPresenceTimeoutSeconds = 60U; // 无人后自动关闭灯光的延时
 };
 
 inline bool lightingScheduleContainsMinute(const Thresholds& thresholds,

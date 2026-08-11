@@ -8,8 +8,9 @@
 namespace {
 constexpr char kPreferencesNamespace[] = "envboard";       // NVS 命名空间名字
 constexpr char kThresholdsKey[] = "thresholds";            // 存阈值用的键名
-// ENV7 增加独立的室外光照阈值，光敏2只负责判断是否允许自动照明。
-constexpr uint32_t kThresholdsMagic = 0x454E5637;          // 当前版本魔数 "ENV7"，用来识别数据格式
+// ENV8 增加风扇和灯光各自的无人关闭延时。
+constexpr uint32_t kThresholdsMagic = 0x454E5638;          // 当前版本魔数 "ENV8"，用来识别数据格式
+constexpr uint32_t kLegacyThresholdsMagicV7 = 0x454E5637;  // 旧版本魔数 "ENV7"
 constexpr uint32_t kLegacyThresholdsMagicV6 = 0x454E5636;  // 旧版本魔数 "ENV6"
 constexpr uint32_t kLegacyThresholdsMagic = 0x454E5635;    // 更旧版本魔数 "ENV5"
 
@@ -43,6 +44,23 @@ struct StoredThresholdsV6 {
   uint32_t magic;               // 版本魔数
   LegacyThresholdsV6 values;    // 阈值数据
   uint32_t checksum;            // 校验和
+};
+
+// ENV7 的结构，保留用于从旧固件迁移；新增无人延时使用 Thresholds 的默认值。
+struct LegacyThresholdsV7 {
+  float outdoorLightThresholdPercent;
+  float lightHoldPercent;
+  float mq135Aqi;
+  float temperatureC;
+  float humidityPercent;
+  uint16_t lightingStartMinute;
+  uint16_t lightingEndMinute;
+};
+
+struct StoredThresholdsV7 {
+  uint32_t magic;
+  LegacyThresholdsV7 values;
+  uint32_t checksum;
 };
 
 // 当前版本在 NVS 里存储的结构（values 直接用共享的 Thresholds 结构体）
@@ -79,7 +97,9 @@ bool thresholdsAreValid(const Thresholds& value) {
          isfinite(value.mq135Aqi) && value.mq135Aqi >= 0.0f && value.mq135Aqi <= 500.0f &&
          isfinite(value.temperatureC) && value.temperatureC >= 0.0f && value.temperatureC <= 60.0f &&
          isfinite(value.humidityPercent) && value.humidityPercent >= 0.0f && value.humidityPercent <= 100.0f &&
-         value.lightingStartMinute < 24U * 60U && value.lightingEndMinute < 24U * 60U;  // 时间必须落在一天 1440 分钟内
+         value.lightingStartMinute < 24U * 60U && value.lightingEndMinute < 24U * 60U &&
+         value.fanNoPresenceTimeoutSeconds >= 1U && value.fanNoPresenceTimeoutSeconds <= 86400U &&
+         value.lightingNoPresenceTimeoutSeconds >= 1U && value.lightingNoPresenceTimeoutSeconds <= 86400U;  // 时间必须落在一天内
 }
 }  // namespace   // 匿名命名空间结束
 
@@ -92,14 +112,14 @@ bool thresholdStoreBegin(Thresholds& thresholds) {
   }
 
   const size_t storedSize = preferences.getBytesLength(kThresholdsKey);  // 先看已存数据有多大，用大小判断是哪个版本
-  if (storedSize == sizeof(StoredThresholds)) {                          // 大小等于当前版本结构 → 按 ENV7 解析
+  if (storedSize == sizeof(StoredThresholds)) {                          // 大小等于当前版本结构 → 按 ENV8 解析
     StoredThresholds stored{};                                          // {} 表示全部清零初始化
     const size_t bytesRead = preferences.getBytes(kThresholdsKey, &stored, sizeof(stored));  // 读出全部字节
     if (bytesRead == sizeof(stored) && stored.magic == kThresholdsMagic &&                   // 字节数对、魔数对
         stored.checksum == checksumThresholds(stored.values) &&                              // 校验和对
         thresholdsAreValid(stored.values)) {                                                 // 数据在合理范围
       thresholds = stored.values;                                                            // 全部条件满足才采用
-      Serial.printf("[NVS] thresholds restored: outdoorLight=%.0f%% lightHold=%.0f%% schedule=%02u:%02u-%02u:%02u AQI=%.0f T=%.1fC H=%.0f%%\r\n",
+      Serial.printf("[NVS] thresholds restored: outdoorLight=%.0f%% lightHold=%.0f%% schedule=%02u:%02u-%02u:%02u AQI=%.0f T=%.1fC H=%.0f%% fanNoPresence=%us lightNoPresence=%us\r\n",
                     thresholds.outdoorLightThresholdPercent,
                     thresholds.lightHoldPercent,
                     thresholds.lightingStartMinute / 60U,      // 分钟转小时
@@ -107,8 +127,28 @@ bool thresholdStoreBegin(Thresholds& thresholds) {
                     thresholds.lightingEndMinute / 60U,
                     thresholds.lightingEndMinute % 60U,
                     thresholds.mq135Aqi,
-                    thresholds.temperatureC, thresholds.humidityPercent);
+                    thresholds.temperatureC, thresholds.humidityPercent,
+                    static_cast<unsigned>(thresholds.fanNoPresenceTimeoutSeconds),
+                    static_cast<unsigned>(thresholds.lightingNoPresenceTimeoutSeconds));
       return true;                                                                           // 读取成功
+    }
+  } else if (storedSize == sizeof(StoredThresholdsV7)) {   // 大小等于 ENV7 → 迁移无人延时默认值
+    StoredThresholdsV7 stored{};
+    const size_t bytesRead = preferences.getBytes(kThresholdsKey, &stored, sizeof(stored));
+    if (bytesRead == sizeof(stored) && stored.magic == kLegacyThresholdsMagicV7 &&
+        stored.checksum == checksumBytes(&stored.values, sizeof(stored.values))) {
+      thresholds.outdoorLightThresholdPercent = stored.values.outdoorLightThresholdPercent;
+      thresholds.lightHoldPercent = stored.values.lightHoldPercent;
+      thresholds.mq135Aqi = stored.values.mq135Aqi;
+      thresholds.temperatureC = stored.values.temperatureC;
+      thresholds.humidityPercent = stored.values.humidityPercent;
+      thresholds.lightingStartMinute = stored.values.lightingStartMinute;
+      thresholds.lightingEndMinute = stored.values.lightingEndMinute;
+      if (thresholdsAreValid(thresholds)) {
+        Serial.println("[NVS] migrating ENV7 thresholds with default no-presence timeouts");
+        thresholdStoreSave(thresholds);
+        return true;
+      }
     }
   } else if (storedSize == sizeof(StoredThresholdsV6)) {   // 大小等于 V6 → 迁移老数据
     StoredThresholdsV6 stored{};
@@ -122,7 +162,7 @@ bool thresholdStoreBegin(Thresholds& thresholds) {
       thresholds.lightingStartMinute = stored.values.lightingStartMinute;
       thresholds.lightingEndMinute = stored.values.lightingEndMinute;
       if (thresholdsAreValid(thresholds)) {                              // 迁移后仍需校验范围
-        Serial.println("[NVS] migrating ENV6 thresholds with default outdoor-light threshold");
+        Serial.println("[NVS] migrating ENV6 thresholds with default outdoor-light and no-presence settings");
         thresholdStoreSave(thresholds);                                  // 立刻用新格式重新保存一次
         return true;
       }
@@ -137,7 +177,7 @@ bool thresholdStoreBegin(Thresholds& thresholds) {
       thresholds.temperatureC = stored.values.temperatureC;
       thresholds.humidityPercent = stored.values.humidityPercent;
       if (thresholdsAreValid(thresholds)) {                              // 校验范围
-        Serial.println("[NVS] migrating ENV5 thresholds with default lighting schedule and outdoor-light threshold");
+        Serial.println("[NVS] migrating ENV5 thresholds with default lighting schedule, outdoor-light and no-presence settings");
         thresholdStoreSave(thresholds);                                  // 用新格式重新保存
         return true;
       }
@@ -157,7 +197,7 @@ bool thresholdStoreSave(const Thresholds& thresholds) {
     Serial.println("[NVS] ERROR: threshold save failed");
     return false;
   }
-  Serial.printf("[NVS] thresholds saved: outdoorLight=%.0f%% lightHold=%.0f%% schedule=%02u:%02u-%02u:%02u AQI=%.0f T=%.1fC H=%.0f%%\r\n",
+  Serial.printf("[NVS] thresholds saved: outdoorLight=%.0f%% lightHold=%.0f%% schedule=%02u:%02u-%02u:%02u AQI=%.0f T=%.1fC H=%.0f%% fanNoPresence=%us lightNoPresence=%us\r\n",
                 thresholds.outdoorLightThresholdPercent,
                 thresholds.lightHoldPercent,
                 thresholds.lightingStartMinute / 60U,
@@ -165,6 +205,8 @@ bool thresholdStoreSave(const Thresholds& thresholds) {
                 thresholds.lightingEndMinute / 60U,
                 thresholds.lightingEndMinute % 60U,
                 thresholds.mq135Aqi,
-                thresholds.temperatureC, thresholds.humidityPercent);
+                thresholds.temperatureC, thresholds.humidityPercent,
+                static_cast<unsigned>(thresholds.fanNoPresenceTimeoutSeconds),
+                static_cast<unsigned>(thresholds.lightingNoPresenceTimeoutSeconds));
   return true;                            // 写入成功
 }

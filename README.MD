@@ -18,8 +18,8 @@ ESP32-S3 教室环境监测器：SSD1306 OLED 实时显示两路光照、MQ135 �
 | MQ135 模块 | AO | 经 10kΩ/18kΩ 分压后接 15 |
 | DHT11 | DATA | 16 |
 | LD2402 人体存在雷达 | OUT | 10 |
-| DS3231SN RTC | SDA | 47 |
-| DS3231SN RTC | SCL | 48 |
+| PCF8563T RTC | SDA | 47 |
+| PCF8563T RTC | SCL | 48 |
 | 舵机信号 | PWM | 21 |
 | L9110H 风扇 | IN1 / IN2 | 41 / 42 |
 | CJ3400 LED 1 | Gate | 11 |
@@ -28,7 +28,7 @@ ESP32-S3 教室环境监测器：SSD1306 OLED 实时显示两路光照、MQ135 �
 
 所有模块必须共地。EC11 按键按下为高电平，程序使用 GPIO 8 的内部下拉。无源蜂鸣器模块由 GPIO9 输出 2.4kHz 方波，停止时保持高电平以兼容低电平触发。裸蜂鸣器或 5V 大电流蜂鸣器必须通过三极管/MOSFET 驱动，不能直接由 GPIO9 供电。
 
-DS3231SN 使用独立的两线 I2C 总线（GPIO47/48），OLED 使用另一组 I2C 总线（GPIO17/18），两者不共线。启用 8MB OPI PSRAM 时不要使用 GPIO35/36/37，这些引脚属于 PSRAM 总线。DS3231 的 SDA/SCL 需要上拉到 3.3V（多数模块已自带），地址通常为 `0x68`。RTC 上电后作为所有实际日期时间的唯一来源；联网成功后按配置的 NTP 服务器校时并回写 RTC。系统时区固定为 `Asia/Shanghai`（UTC+8），主页下方的“时间与 NTP”区域（也可直接访问 `/time`）会显示上海时间，并可修改 NTP 服务器或手动校时。
+PCF8563T 使用独立的两线 I2C 总线（GPIO47/48），OLED 使用另一组 I2C 总线（GPIO17/18），两者不共线。启用 8MB OPI PSRAM 时不要使用 GPIO35/36/37，这些引脚属于 PSRAM 总线。PCF8563T 的 SDA/SCL 需要上拉到 3.3V（多数模块已自带），7 位地址为 `0x51`。RTC 上电后作为所有实际日期时间的唯一来源；联网成功后按配置的 NTP 服务器校时并回写 RTC。系统时区固定为 `Asia/Shanghai`（UTC+8），主页下方的“时间与 NTP”区域（也可直接访问 `/time`）会显示上海时间，并可修改 NTP 服务器或手动校时。
 
 舵机信号接 GPIO21，舵机电源应使用独立 5V 供电并与 ESP32 共地，不能从 ESP32 3.3V 直接给舵机供电。温度、湿度、AQI 三项中至少两项超过各自阈值时，逻辑舵机转到 180°位置；恢复到少于两项超限时回到逻辑 0°。当前固件已反转 PWM 端点以适配反向安装，WebUI/OLED 角度显示仍按逻辑角度工作。L9110H 的 IN1/IN2 接 GPIO41/42，风扇电机使用独立电源并与 ESP32 共地；有人且温度、湿度、AQI任意一项超阈值时自动启动，LD2402持续无人达到 WebUI 设置的风扇延时后自动停机。自动运行中风扇每100ms向计算目标调整1%，与目标相差不超过2%时保持；启动直接进入40%可靠起转速度，目标为0时立即停机。
 
@@ -36,7 +36,7 @@ DS3231SN 使用独立的两线 I2C 总线（GPIO47/48），OLED 使用另一组 
 
 主页时间卡片下方的“调试执行器页面”（`/actuators`）提供舵机半圆拖动环（0°-180°）、L9110H 风扇控制、三路 LED 独立亮度滑块和蜂鸣器启用开关。每类执行器均可单独恢复自动控制；LED 进入手动模式后三路保持各自设定的 0–100% 亮度，其中 100% 对应下述受限后的最大 PWM，恢复自动调光后重新跟随对应光敏读数。蜂鸣器启用状态保存在独立的 `buzzer_cfg` NVS 命名空间，重启后继续生效，默认启用。
 
-若串口提示 `no I2C ACK at 0x68`，请检查模块供电为 3.3V、共地、SDA/SCL 是否接反、GPIO47/48 是否与板卡实际引脚一致，以及模块是否存在 4.7kΩ 左右的 SDA/SCL 上拉电阻。
+若串口提示 `no I2C ACK at 0x51`，请检查模块供电为 3.3V、共地、SDA/SCL 是否接反、GPIO47/48 是否与板卡实际引脚一致，以及模块是否存在 4.7kΩ 左右的 SDA/SCL 上拉电阻。
 
 > 注意：MQ135 加热器使用 5V 供电，但 ESP32-S3 GPIO 只能接受 **0–3.3V**。请按 `MQ135 AO → 10kΩ → GPIO15 → 18kΩ → GND` 接入分压，理论上可把 5V 最大输入降至约 3.21V；所有模块必须共地。不要把 5V 供电模块的 AO 直接接 GPIO15。
 
@@ -84,6 +84,7 @@ WebUI 的“数据上报”区域可配置 API Base URL（例如 `https://api.ex
 - HTTPS 上报前会在后台通过 SNTP 同步证书校验时间，同步期间 WebUI 和传感器继续运行，请求会暂缓而不会绕过校验；20 秒仍未取得时间时回调日志记录错误 `-13`，之后继续自动重试。
 - 固定上报两路光照百分比、两路 ADC 原始值和 LD2402 的 `presence`；MQ135 预热完成后才包含 `aqi`，DHT11 读数有效时才包含 `temperature` 和相对湿度 `humidity`（单位 `%`，范围 0–100）。
 - WebUI 的 IP 状态下方同步显示最近数据上报、最近心跳上报和 API 连通状态；未联网时 IP 显示“未连接”。
+- WebUI 首页提供“系统日志”区域，可查看启动时的 OLED/I2C 探测结果并清空内存日志；日志不会跨重启保存。
 - 串口用 `[REPORT]` 输出 HTTP 201、服务端 HTTP 错误或网络传输错误。WebUI 的 HTTP 2xx 成功回调最多保留最近 5 条且响应正文最多保留 64 字节；错误记录优先保留，最多使用 12 条总容量并保留最多 256 字节响应正文。
 
 ## 串口日志
@@ -110,8 +111,9 @@ include/
   network_portal.h # 本地热点配网和 WebUI
   oled_controller.h # OLED 页面状态与交互控制接口
   report_uploader.h # HTTP 定时上报与配置接口
-  rtc_clock.h       # DS3231 I2C RTC、NTP 与手动校时
+  rtc_clock.h       # PCF8563T I2C RTC、NTP 与手动校时
   sensors.h      # 环境传感器数据与采集接口声明，实现在 main
+  system_log.h   # WebUI 可查看的启动/系统环形日志接口
   servo.h        # 舵机引脚与控制接口声明，实现在 main
   SSD1306.h      # OLED 绘制接口与引脚
   threshold_store.h # 阈值 NVS 存储
@@ -122,8 +124,9 @@ src/
   network_portal.cpp # Wi-Fi 配网、DNS 引导、WebUI、凭据 NVS
   oled_controller.cpp # OLED 页面状态、旋钮交互和渲染调度
   report_uploader.cpp # 上报 JSON、Bearer 鉴权和配置 NVS
-  rtc_clock.cpp   # DS3231 I2C 读写、NTP 同步和上海时区转换
+  rtc_clock.cpp   # PCF8563T I2C 读写、NTP 同步和上海时区转换
   SSD1306.cpp    # 监测与设置界面
   threshold_store.cpp # 阈值 NVS 校验与保存
+  system_log.cpp # 内存环形系统日志及 JSON 输出
   main.cpp       # 传感器及 LED/风扇/舵机的初始化、读取、输出与自动策略
 ```

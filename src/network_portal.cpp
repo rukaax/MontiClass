@@ -21,6 +21,7 @@
 #include "fan.h"              // WebUI 里查询/覆盖风扇状态
 #include "lighting.h"        // WebUI 里查询/覆盖 LED 状态
 #include "servo.h"           // WebUI 里查询/覆盖舵机角度
+#include "system_log.h"      // 启动诊断日志的 WebUI 查询
 #include "threshold_store.h" // 光照阈值和调光时段的持久化
 
 namespace {
@@ -665,7 +666,7 @@ const char kTimePageV2[] PROGMEM = R"HTML(
   <body>
     <section class="card">
       <h1>RTC 时间校准</h1>
-      <p class="muted">所有时间均按上海时间（UTC+8）写入 DS3231。</p>
+      <p class="muted">所有时间均按上海时间（UTC+8）写入 PCF8563T。</p>
       <div class="readout">
         <span class="muted">当前 RTC 读取时间（Asia/Shanghai）</span><strong id="now">--</strong>
       </div>
@@ -700,7 +701,7 @@ const char kTimePageV2[] PROGMEM = R"HTML(
             ? "正在等待 NTP 服务器响应…"
             : r.valid
               ? "RTC 已连接"
-              : "请检查 DS3231 接线";
+              : "请检查 PCF8563T 接线";
         } catch (e) {
           $("msg").textContent = "读取时间失败";
         }
@@ -801,7 +802,7 @@ const char kHomeTimeWidgetV2[] PROGMEM = R"HTML(
         ? "正在等待 NTP 服务器响应…"
         : s.valid
           ? "RTC 正常"
-          : "RTC 未读取到，请检查 0x68 接线和供电";
+          : "RTC 未读取到，请检查 0x51 接线和供电";
       if (!rtc$("rtcNtp").value) rtc$("rtcNtp").value = s.ntpServer || "pool.ntp.org";
       if (document.activeElement !== rtc$("rtcDate") && document.activeElement !== rtc$("rtcTime"))
         rtcFill(s.now);
@@ -837,8 +838,26 @@ const char kHomeTimeWidgetV2[] PROGMEM = R"HTML(
 </script>
 )HTML";
 
-const char kActuatorLink[] PROGMEM = R"HTML(
-<p class="muted" style="margin-top: 12px"><a href="/actuators">打开调试执行器页面</a></p>
+const char kPageNav[] PROGMEM = R"HTML(
+<nav class="page-nav" aria-label="页面导航">
+  <a href="/">监测首页</a><a href="/time">时间校准</a><a href="/actuators">执行器调试</a><a href="/system">系统信息</a>
+</nav>
+<style>.page-nav{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px;margin:0 0 4px}.page-nav a{display:inline-block;padding:9px 13px;border-radius:7px;background:#2563eb;color:#fff;text-decoration:none;font-weight:700}.page-nav a:hover{background:#1d4ed8}</style>
+)HTML";
+
+const char kSystemPage[] PROGMEM = R"HTML(
+<!doctype html><html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>系统信息</title><style>
+body{max-width:1000px;margin:24px auto;padding:0 16px;font:16px system-ui;color:#172033;background:#f5f7fb}
+.card{background:#fff;border-radius:10px;padding:18px;margin-top:14px;box-shadow:0 2px 10px #0001}.page-nav{display:flex;flex-wrap:wrap;gap:8px}.page-nav a{padding:9px 13px;border-radius:7px;background:#2563eb;color:#fff;text-decoration:none;font-weight:700}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}.item{padding:12px;border:1px solid #dbe2ed;border-radius:8px;background:#f8fafc}.muted{color:#596579;font-size:.9rem}strong{display:block;margin-top:4px;font-size:1.12rem;word-break:break-word}button{padding:10px 14px;border:0;border-radius:7px;background:#2563eb;color:#fff;font-weight:700}@media(max-width:600px){body{margin:14px auto}}
+</style><body><nav class="page-nav" aria-label="页面导航"><a href="/">监测首页</a><a href="/time">时间校准</a><a href="/actuators">执行器调试</a><a href="/system">系统信息</a></nav>
+<section class="card"><h1>系统信息</h1><p id="status" class="muted">读取中…</p><div class="grid">
+<div class="item">CPU 型号<strong id="chip">--</strong></div><div class="item">CPU 频率<strong id="cpu">--</strong></div><div class="item">CPU ID<strong id="id">--</strong></div>
+<div class="item">Flash 总容量<strong id="flash">--</strong></div><div class="item">程序 Flash 占用<strong id="appflash">--</strong></div><div class="item">堆内存<strong id="heap">--</strong></div>
+<div class="item">PSRAM 总容量<strong id="psram">--</strong></div><div class="item">PSRAM 已用<strong id="psramused">--</strong></div><div class="item">芯片温度<strong id="temp">--</strong></div>
+</div></section><section class="card"><h2>I2C 实时模块列表</h2><p class="muted">以下是本次扫描实际收到 ACK 的 7 位地址；未响应的配置地址不会显示。</p><div class="grid"><div class="item">OLED 总线实时应答<strong id="oled">--</strong></div><div class="item">RTC 总线实时应答<strong id="rtc">--</strong></div></div><p><button id="refresh" type="button">立即重新扫描</button></p></section>
+<section class="card"><h2>系统日志</h2><p class="muted">启动诊断和最近硬件状态消息，重启后清空。</p><p><button id="clearLogs" type="button">清空日志</button></p><pre id="logs" class="muted" style="white-space:pre-wrap;max-height:260px;overflow:auto">读取中…</pre></section>
+<script>const $=id=>document.getElementById(id), mb=n=>(n/1048576).toFixed(2)+" MB", fmt=a=>a&&a.length?a.join(", "):"未发现设备";async function load(){try{let r=await (await fetch("/api/system-info",{cache:"no-store"})).json();$("chip").textContent=r.chip;$("cpu").textContent=r.cpuMHz+" MHz";$("id").textContent=r.cpuId;$("flash").textContent=mb(r.flashBytes);$("appflash").textContent=mb(r.appBytes)+" / "+mb(r.appPartitionBytes);$("heap").textContent=mb(r.heapUsed)+" / "+mb(r.heapBytes)+"（剩余 "+mb(r.heapFree)+"）";$("psram").textContent=r.psramFound?mb(r.psramBytes):"未检测到";$("psramused").textContent=r.psramFound?mb(r.psramUsed)+"（剩余 "+mb(r.psramFree)+"）":"--";$("temp").textContent=r.temperature===null?"不可用":r.temperature+" °C";$("oled").textContent=fmt(r.oledI2c);$("rtc").textContent=fmt(r.rtcI2c);$("status").textContent="已更新："+new Date().toLocaleTimeString();}catch(e){$("status").textContent="读取系统信息失败"}}async function logs(){try{let a=await (await fetch("/api/system-log",{cache:"no-store"})).json(), box=$("logs");box.textContent=a.length?a.map(x=>x.line).join("\n"):"暂无系统日志";box.scrollTop=box.scrollHeight;}catch(e){$("logs").textContent="读取系统日志失败"}}$("refresh").onclick=()=>{load();logs()};$("clearLogs").onclick=async()=>{await fetch("/api/system-log/clear",{method:"POST"});logs()};load();logs();setInterval(load,5000);setInterval(logs,1000);</script></body></html>
 )HTML";
 
 
@@ -1410,7 +1429,7 @@ void NetworkPortal::configureRoutes() {
   reportUploader_.configureRoutes(server_);
   server_.on("/", HTTP_GET, [this]() {
     String page(kWebPage);
-    page.replace("</body>", String(kHomeTimeWidgetV2) + String(kActuatorLink) + String(kWebUiFixes) + "</body>");
+    page.replace("</body>", String(kPageNav) + String(kWebUiFixes) + "</body>");
     server_.sendHeader("Cache-Control", "no-store");
     server_.send(200, "text/html; charset=utf-8", page);
   });
@@ -1419,11 +1438,19 @@ void NetworkPortal::configureRoutes() {
   server_.on("/api/lighting-config", HTTP_POST, [this]() { receiveLightingConfig(); });
   server_.on("/time", HTTP_GET, [this]() {
     server_.sendHeader("Cache-Control", "no-store");
-    server_.send_P(200, "text/html; charset=utf-8", kTimePageV2);
+    String page(kTimePageV2);
+    page.replace("<body>", String("<body>") + String(kPageNav));
+    server_.send(200, "text/html; charset=utf-8", page);
   });
   server_.on("/actuators", HTTP_GET, [this]() {
     server_.sendHeader("Cache-Control", "no-store");
-    server_.send_P(200, "text/html; charset=utf-8", kActuatorPageV5);
+    String page(kActuatorPageV5);
+    page.replace("<body>", String("<body>") + String(kPageNav));
+    server_.send(200, "text/html; charset=utf-8", page);
+  });
+  server_.on("/system", HTTP_GET, [this]() {
+    server_.sendHeader("Cache-Control", "no-store");
+    server_.send_P(200, "text/html; charset=utf-8", kSystemPage);
   });
   server_.on("/api/actuator", HTTP_GET, [this]() {
     char response[352];
@@ -1536,6 +1563,9 @@ void NetworkPortal::configureRoutes() {
   server_.on("/api/time", HTTP_GET, [this]() { sendTime(); });
   server_.on("/api/time", HTTP_POST, [this]() { receiveTime(); });
   server_.on("/api/networks", HTTP_GET, [this]() { sendNetworks(); });
+  server_.on("/api/system-log", HTTP_GET, [this]() { sendSystemLogs(); });
+  server_.on("/api/system-log/clear", HTTP_POST, [this]() { clearSystemLogs(); });
+  server_.on("/api/system-info", HTTP_GET, [this]() { sendSystemInfo(); });
   server_.on("/api/wifi", HTTP_POST, [this]() { receiveCredentials(); });
   server_.on("/api/wifi/reset", HTTP_POST, [this]() {
     clearCredentials();
@@ -1837,6 +1867,44 @@ void NetworkPortal::sendNetworks() {
   }
   server_.sendHeader("Cache-Control", "no-store");
   server_.send(200, "application/json", networkListJson_);
+}
+
+void NetworkPortal::sendSystemLogs() {
+  server_.sendHeader("Cache-Control", "no-store");
+  server_.send(200, "application/json", SystemLog::json());
+}
+
+void NetworkPortal::clearSystemLogs() {
+  SystemLog::clear();
+  server_.send(200, "application/json", "{\"ok\":true}");
+}
+
+void NetworkPortal::sendSystemInfo() {
+  const uint32_t heapBytes = ESP.getHeapSize();
+  const uint32_t heapFree = ESP.getFreeHeap();
+  const bool hasPsram = psramFound();
+  const uint32_t psramBytes = hasPsram ? ESP.getPsramSize() : 0;
+  const uint32_t psramFree = hasPsram ? ESP.getFreePsram() : 0;
+  const uint64_t efuseMac = ESP.getEfuseMac();
+  char cpuId[24];
+  snprintf(cpuId, sizeof(cpuId), "%012llX", static_cast<unsigned long long>(efuseMac & 0x0000FFFFFFFFFFFFULL));
+  String response = "{\"chip\":\"" + escapeJson(ESP.getChipModel()) +
+                    "\",\"cpuMHz\":" + String(getCpuFrequencyMhz()) +
+                    ",\"cpuId\":\"" + cpuId +
+                    "\",\"flashBytes\":" + String(ESP.getFlashChipSize()) +
+                    ",\"appBytes\":" + String(ESP.getSketchSize()) +
+                    ",\"appPartitionBytes\":" + String(ESP.getSketchSize() + ESP.getFreeSketchSpace()) +
+                    ",\"heapBytes\":" + String(heapBytes) +
+                    ",\"heapFree\":" + String(heapFree) +
+                    ",\"heapUsed\":" + String(heapBytes >= heapFree ? heapBytes - heapFree : 0) +
+                    ",\"psramFound\":" + String(hasPsram ? "true" : "false") +
+                    ",\"psramBytes\":" + String(psramBytes) +
+                    ",\"psramFree\":" + String(psramFree) +
+                    ",\"psramUsed\":" + String(psramBytes >= psramFree ? psramBytes - psramFree : 0) +
+                    ",\"temperature\":null,\"oledI2c\":" + oledI2cDevicesJson() +
+                    ",\"rtcI2c\":" + rtcI2cDevicesJson() + "}";
+  server_.sendHeader("Cache-Control", "no-store");
+  server_.send(200, "application/json", response);
 }
 
 // 启动一次异步 Wi-Fi 扫描；失败时按 kNetworkScanMaxAttempts 有限次重试。

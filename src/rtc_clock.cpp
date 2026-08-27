@@ -9,7 +9,8 @@
 namespace {
 constexpr char kPreferencesNamespace[] = "time_config";   // NVS 里这块配置的命名空间名
 constexpr char kNtpServerKey[] = "ntp_server";            // NVS 里保存 NTP 服务器地址的键名
-constexpr uint8_t kRtcAddress = 0x68;                     // DS3231 芯片固定的 I2C 从机地址
+constexpr uint8_t kRtcAddress = 0x51;                     // PCF8563T 的 7 位 I2C 从机地址（8 位写地址为 0xA2）
+constexpr uint8_t kRtcTimeRegister = 0x02;                // PCF8563T 时间寄存器从 VL_seconds 开始
 constexpr time_t kMinimumValidEpoch = 1704067200;  // 2024-01-01 UTC   // 早于此时间戳视为无效时间
 constexpr time_t kShanghaiOffsetSeconds = 8 * 3600;       // 东八区相对 UTC 的偏移（8 小时的秒数）
 TwoWire rtcWire(1);                                       // 用 1 号 I2C 控制器单独给 RTC 用（和 OLED 分开）
@@ -27,7 +28,7 @@ bool rtcDevicePresent() {
   return rtcWire.endTransmission() == 0;                  // 返回 0 表示对方应答成功，即设备在线
 }
 
-// 十进制转 BCD 码（DS3231 寄存器用 BCD 存储，比如 25 存成 0x25）
+// 十进制转 BCD 码（PCF8563T 寄存器用 BCD 存储，比如 25 存成 0x25）
 uint8_t toBcd(uint8_t value) { return static_cast<uint8_t>((value / 10U) * 16U + value % 10U); }
 // BCD 码转回十进制
 uint8_t fromBcd(uint8_t value) { return static_cast<uint8_t>((value >> 4U) * 10U + (value & 0x0fU)); }
@@ -66,6 +67,26 @@ RtcDateTime fromLocal(time_t epoch) {
 
 RtcClock rtcClock;   // 全局唯一的时钟对象，供其他文件通过 extern 使用
 
+String rtcI2cDevicesJson() {
+  String result = "[";
+  const uint16_t originalTimeout = rtcWire.getTimeOut();
+  rtcWire.setTimeOut(20);
+  bool first = true;
+  for (uint8_t address = 0x08; address < 0x78; ++address) {
+    rtcWire.beginTransmission(address);
+    if (rtcWire.endTransmission() != 0) continue;
+    if (!first) result += ',';
+    char text[40];
+    const char* module = address == kRtcAddress ? "PCF8563T RTC" : "未知模块";
+    snprintf(text, sizeof(text), "\"0x%02X (%s)\"", address, module);
+    result += text;
+    first = false;
+  }
+  rtcWire.setTimeOut(originalTimeout);
+  result += ']';
+  return result;
+}
+
 // 类的初始化函数（RtcClock:: 表示这是 RtcClock 类的成员函数）
 void RtcClock::begin() {
   rtcWire.begin(Pins::kRtcSda, Pins::kRtcScl, 100000);   // 启动 I2C：指定 SDA/SCL 引脚，速率 100kHz
@@ -78,11 +99,11 @@ void RtcClock::begin() {
                   kRtcAddress, Pins::kRtcSda, Pins::kRtcScl);   // 打印排查提示
   } else if (read(value)) {                               // 设备在线且成功读出时间
     setEpoch(makeLocalEpoch(value));                      // 用 RTC 的时间设置系统时钟
-    Serial.printf("[RTC] DS3231 I2C ready SDA=%u SCL=%u: %04u-%02u-%02u %02u:%02u:%02u\r\n",
+    Serial.printf("[RTC] PCF8563T I2C ready SDA=%u SCL=%u: %04u-%02u-%02u %02u:%02u:%02u\r\n",
                   Pins::kRtcSda, Pins::kRtcScl, value.year, value.month, value.day,
                   value.hour, value.minute, value.second);     // 打印当前时间
   } else {
-    Serial.println("[RTC] DS3231 not detected or date invalid; waiting for NTP/manual set");  // 读失败或时间非法
+    Serial.println("[RTC] PCF8563T not detected or date invalid; waiting for NTP/manual set");  // 读失败或时间非法
   }
 }
 
@@ -95,64 +116,38 @@ bool RtcClock::validDate(const RtcDateTime& value) const {
   return value.day >= 1 && value.day <= maxDay;           // 日必须在合法范围内
 }
 
-// 从 DS3231 读取当前时间到 value
+// 从 PCF8563T 读取当前时间到 value
 bool RtcClock::read(RtcDateTime& value) const {
   if (!initialized_ || !rtcDevicePresent()) return false;  // 未初始化或设备不在线，直接失败
   rtcWire.beginTransmission(kRtcAddress);                  // 开始通信
-  rtcWire.write(0x00);                                     // 把寄存器指针指向 0x00（秒寄存器）
+  rtcWire.write(kRtcTimeRegister);                         // 把寄存器指针指向 0x02（VL_seconds）
   const uint8_t registerResult = rtcWire.endTransmission(false);   // false=保持连接（重复起始），准备接着读
   if (registerResult != 0) return false;                   // 设置寄存器地址失败
   const uint8_t received = rtcWire.requestFrom(kRtcAddress, static_cast<uint8_t>(7));   // 请求读取 7 个字节（秒~年）
   uint8_t raw[7]{};                                        // 存放原始 BCD 数据，{} 清零
   for (uint8_t i = 0; i < received && i < sizeof(raw); ++i) raw[i] = rtcWire.read();    // 逐字节读入
   if (received != 7) return false;                         // 没读满 7 字节则失败
-  if (!rtcDevicePresent()) return false;                   // 再次确认设备仍在线
-  rtcWire.beginTransmission(kRtcAddress);                  // 再开始一次通信
-  rtcWire.write(0x0f);                                     // 指向状态寄存器 0x0F
-  const uint8_t statusRegisterResult = rtcWire.endTransmission(false);   // 保持连接准备读状态
-  if (statusRegisterResult != 0) return false;             // 设置地址失败
-  const uint8_t statusReceived = rtcWire.requestFrom(kRtcAddress, static_cast<uint8_t>(1));   // 读 1 个状态字节
-  uint8_t statusRaw = statusReceived == 1 ? rtcWire.read() : 0;   // 读到就取值，否则记 0
-  if (statusReceived != 1 || (statusRaw & 0x80) != 0) return false;   // 读失败或 OSF 位=1(振荡器曾停)则视为无效
+  if ((raw[0] & 0x80) != 0) return false;                  // VL=1 表示低电压后时钟数据不可信
   value.second = fromBcd(raw[0] & 0x7f);                   // 秒：低 7 位有效
   value.minute = fromBcd(raw[1] & 0x7f);                   // 分：低 7 位有效
-  if ((raw[2] & 0x40) != 0) {                              // bit6=1 表示 12 小时制
-    value.hour = fromBcd(raw[2] & 0x1f);                   // 取低 5 位得到 1~12 的小时
-    if ((raw[2] & 0x20) != 0 && value.hour < 12) value.hour += 12;        // PM 且非 12 点，加 12 转 24 小时制
-    else if ((raw[2] & 0x20) == 0 && value.hour == 12) value.hour = 0;    // AM 12 点即午夜 0 点
-  } else {
-    value.hour = fromBcd(raw[2] & 0x3f);                   // 24 小时制：取低 6 位
-  }
-  value.day = fromBcd(raw[4] & 0x3f);                      // 日（raw[3] 是星期，跳过不用）
+  value.hour = fromBcd(raw[2] & 0x3f);                     // PCF8563T 只使用 24 小时制
+  value.day = fromBcd(raw[3] & 0x3f);                      // 日（raw[4] 是星期，跳过不用）
   value.month = fromBcd(raw[5] & 0x1f);                    // 月：低 5 位（bit7 是世纪位，忽略）
   value.year = static_cast<uint16_t>(2000 + fromBcd(raw[6]));   // 年：寄存器存的是 00~99，加上 2000
   return validDate(value);                                 // 最后校验读出的日期是否合理
 }
 
-// 把 value 写入 DS3231（设置时间）
+// 把 value 写入 PCF8563T（设置时间）
 bool RtcClock::set(const RtcDateTime& value) {
   if (!initialized_ || !validDate(value) || !rtcDevicePresent()) return false;   // 未初始化/日期非法/设备离线则失败
-  const uint8_t raw[] = {toBcd(value.second), toBcd(value.minute), toBcd(value.hour), 1,
-                         toBcd(value.day), toBcd(value.month), toBcd(static_cast<uint8_t>(value.year - 2000))};   // 转成寄存器顺序的 BCD 数组（第4个是星期，固定填1）
+  const uint8_t raw[] = {toBcd(value.second), toBcd(value.minute), toBcd(value.hour),
+                         toBcd(value.day), 1, toBcd(value.month),
+                         toBcd(static_cast<uint8_t>(value.year - 2000))};   // 转成寄存器顺序的 BCD 数组（星期固定填1）
   rtcWire.beginTransmission(kRtcAddress);                  // 开始通信
-  rtcWire.write(0x00);                                     // 指向秒寄存器
+  rtcWire.write(kRtcTimeRegister);                         // 指向 VL_seconds 寄存器
   for (uint8_t item : raw) rtcWire.write(item);            // 范围 for：依次写入全部 7 个字节
   const uint8_t writeResult = rtcWire.endTransmission();   // 结束并发送
   if (writeResult != 0) return false;                      // 写入失败
-  if (!rtcDevicePresent()) return false;                   // 确认设备仍在线
-  rtcWire.beginTransmission(kRtcAddress);                  // 再次通信
-  rtcWire.write(0x0f);                                     // 指向状态寄存器
-  const uint8_t statusRegisterResult = rtcWire.endTransmission(false);   // 保持连接准备读
-  if (statusRegisterResult == 0) {                         // 地址设置成功
-    const uint8_t statusReceived = rtcWire.requestFrom(kRtcAddress, static_cast<uint8_t>(1));   // 读 1 字节状态
-    const uint8_t status = statusReceived == 1 ? rtcWire.read() : 0;   // 读到就取值
-    if (statusReceived == 1) {                             // 成功读到状态
-      rtcWire.beginTransmission(kRtcAddress);              // 再写回
-      rtcWire.write(0x0f);                                 // 指向状态寄存器
-      rtcWire.write(status & ~0x80);                       // 清除 OSF 位(bit7)，表示时间已重新有效
-      rtcWire.endTransmission();                           // 发送
-    }
-  }
   setEpoch(makeLocalEpoch(value));                         // 同步更新系统时钟
   return true;                                             // 成功
 }
@@ -239,10 +234,10 @@ void RtcClock::updateNtp(bool networkConnected) {
   const time_t epoch = time(nullptr);                      // 取当前系统时间戳
   if (ntpSyncReceived && epoch >= kMinimumValidEpoch) {    // 收到同步且时间有效
     ntpSyncReceived = false;                               // 清标志
-    if (set(fromLocal(epoch))) {                           // 把网络时间写进 DS3231
+    if (set(fromLocal(epoch))) {                           // 把网络时间写进 PCF8563T
       Serial.printf("[RTC] NTP synchronized: %s\r\n", isoString().c_str());   // 成功
     } else {
-      Serial.println("[RTC] NTP response received, but DS3231 write failed");  // 写 RTC 失败
+      Serial.println("[RTC] NTP response received, but PCF8563T write failed");  // 写 RTC 失败
     }
     ntpPending_ = false;                                   // 结束等待
   } else if (millis() - ntpStartedMs_ > 30000) {           // 超过 30 秒还没同步成功

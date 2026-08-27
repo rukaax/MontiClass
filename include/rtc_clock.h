@@ -1,5 +1,5 @@
 /** @file rtc_clock.h
- * @brief DS3231SN two-wire I2C RTC and NTP synchronization.
+ * @brief PCF8563T two-wire I2C RTC and NTP synchronization.
  */
 #pragma once
 
@@ -48,3 +48,6 @@ class RtcClock {
 };
 
 extern RtcClock rtcClock;
+
+// 扫描 RTC 专用 I2C 总线，返回 JSON 地址数组供系统信息页显示。
+String rtcI2cDevicesJson();

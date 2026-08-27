@@ -11,13 +11,13 @@
 #include "thresholds.h"
 
 namespace Pins {
-// OLED 使用原工程指定的硬件 I2C 引脚，不使用开发板默认引脚。
 constexpr uint8_t kOledSda = 17;
 constexpr uint8_t kOledScl = 18;
 }
 constexpr uint8_t kOledAddress = 0x3C;  // 常见 SSD1306 的 7 位 I2C 地址。
 
 void oledInit();  // 初始化 I2C 与 SSD1306；必须在任何 draw* 之前调用。
+String oledI2cDevicesJson();
 void drawBootScreen();
 // 无线网络尚未配置时显示热点名称、无密码提示和入口二维码。
 void drawProvisioningScreen(const char* ssid, const char* qrPayload);

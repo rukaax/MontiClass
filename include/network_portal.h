@@ -40,6 +40,9 @@ class NetworkPortal {
   void sendTime();
   void receiveTime();
   void sendNetworks();
+  void sendSystemLogs();
+  void clearSystemLogs();
+  void sendSystemInfo();
   bool startNetworkScan();
   void ensureProvisioningAp();
   void receiveCredentials();

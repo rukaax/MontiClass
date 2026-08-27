@@ -3,9 +3,73 @@
 
 #include <qrcode.h>  // 引入 ESP32 官方二维码生成库，用于配网页面。
 
+#include "buzzer.h"  // OLED 总线无法探测时给出两声短提示。
+#include "system_log.h"  // 把启动诊断同步提供给 WebUI。
+
 namespace {  // 下面这些对象和函数只允许本源文件内部使用（相当于 C 的 static）。
 // U8g2 的全缓冲对象。128x64 单色屏需要约 1 KB RAM，ESP32-S3 足够使用。
 u8g2_t oled;  // 整块屏幕的显示缓冲区；所有绘制先写到它，再一次性刷屏。
+bool oledReady = false;  // 只有目标地址应答后才允许 U8g2 访问 I2C 总线。
+
+const char* i2cErrorName(uint8_t error) {  // 把 Wire.endTransmission() 的错误码转成可读文本。
+  switch (error) {
+    case 0: return "ACK";                         // 地址和数据都发送成功。
+    case 1: return "data-too-long";               // 发送缓冲区溢出。
+    case 2: return "address-NACK";                // 从设备没有应答地址。
+    case 3: return "data-NACK";                   // 从设备没有应答数据。
+    case 4: return "other-error";                 // 其他总线错误。
+    case 5: return "timeout";                     // ESP32 Wire 超时（部分核心版本使用该码）。
+    default: return "unknown-error";
+  }
+}
+
+bool logOledI2cDiagnostics() {  // 启动时扫描 OLED 专用总线，便于区分接线、地址和驱动问题。
+  SystemLog::printf("[OLED][I2C] bus SDA=%u SCL=%u clock=%luHz expected-7bit=0x%02X",
+                static_cast<unsigned>(Pins::kOledSda),
+                static_cast<unsigned>(Pins::kOledScl),
+                static_cast<unsigned long>(Wire.getClock()),
+                static_cast<unsigned>(kOledAddress));
+  SystemLog::printf("[OLED][I2C] idle levels SDA=%s SCL=%s (HIGH normally means pull-up is present)",
+                digitalRead(Pins::kOledSda) ? "HIGH" : "LOW",
+                digitalRead(Pins::kOledScl) ? "HIGH" : "LOW");
+
+  // I2C 空闲时两根线都必须由上拉电阻保持高电平；任一根被拉低时继续逐地址扫描
+  // 可能在驱动层等待总线恢复，导致整个启动流程看起来“卡死”。
+  const bool sdaIdle = digitalRead(Pins::kOledSda) == HIGH;
+  const bool sclIdle = digitalRead(Pins::kOledScl) == HIGH;
+  if (!sdaIdle || !sclIdle) {
+    SystemLog::printf("[OLED][I2C] scan aborted: bus not idle (SDA=%s SCL=%s); check 3.3V/GND, SDA/SCL order, pull-ups and GPIO numbers",
+                  sdaIdle ? "HIGH" : "LOW", sclIdle ? "HIGH" : "LOW");
+    return false;
+  }
+
+  const uint16_t originalTimeout = Wire.getTimeOut();
+  Wire.setTimeOut(20);  // 卡线时每个地址最多等待 20ms，避免 127 个地址拖慢启动。
+  uint8_t deviceCount = 0;
+  uint8_t targetError = 0xFF;
+  for (uint8_t address = 0x01; address < 0x7F; ++address) {
+    Wire.beginTransmission(address);  // 只探测地址，不发送寄存器数据。
+    const uint8_t error = Wire.endTransmission();
+    if (address == kOledAddress) targetError = error;
+    if (error == 0) {
+      ++deviceCount;
+      SystemLog::printf("[OLED][I2C] ACK address=0x%02X", static_cast<unsigned>(address));
+    }
+  }
+  Wire.setTimeOut(originalTimeout);  // 扫描后恢复 Wire/U8g2 原本的事务超时。
+
+  if (targetError == 0) {
+    SystemLog::printf("[OLED][I2C] target 0x%02X responded; SSD1306 init will continue",
+                  static_cast<unsigned>(kOledAddress));
+  } else {
+    SystemLog::printf("[OLED][I2C] target 0x%02X probe failed: code=%u (%s)",
+                  static_cast<unsigned>(kOledAddress),
+                  static_cast<unsigned>(targetError), i2cErrorName(targetError));
+  }
+  SystemLog::printf("[OLED][I2C] scan complete: %u device(s)",
+                static_cast<unsigned>(deviceCount));
+  return targetError == 0;
+}
 
 void drawAlertMark(uint8_t y, bool alert) {  // 在某一行右侧画告警圆点；y 为该行基线。
   if (!alert) return;  // 没有告警就直接返回，不画任何东西。
@@ -34,16 +98,45 @@ void drawQrCode(esp_qrcode_handle_t qrCode) {  // 二维码库的回调：把生
 
 void oledInit() {  // 初始化 OLED：配置 I2C、设置地址、点亮屏幕。
   // 先由 Wire 绑定自定义 SDA/SCL，再交给 U8g2 使用硬件 I2C 后端。
-  Wire.begin(Pins::kOledSda, Pins::kOledScl);  // 指定 OLED 使用的 SDA/SCL 引脚并启动 I2C。
+  const bool busReady = Wire.begin(Pins::kOledSda, Pins::kOledScl, 100000);  // 指定 OLED 使用的 SDA/SCL 引脚并启动 100kHz I2C。
+  SystemLog::printf("[OLED][I2C] Wire.begin=%s", busReady ? "OK" : "FAILED");
+  const bool i2cAvailable = busReady && logOledI2cDiagnostics();  // 在 U8g2 初始化前确认总线上是否能看到 OLED 地址。
   u8g2_Setup_ssd1306_i2c_128x64_noname_f(  // 按 128x64 SSD1306 全缓冲模式配置 U8g2 对象。
       &oled, U8G2_R0, u8x8_byte_arduino_hw_i2c, u8x8_gpio_and_delay_arduino);  // R0=不旋转，使用 Arduino 硬件 I2C。
+  if (!i2cAvailable) {
+    SystemLog::write("[OLED] disabled: I2C target unavailable; firmware will continue without OLED");
+    buzzerAlarmTwoBeep();
+    return;
+  }
   // U8g2 接收 8 位 I2C 地址，所以常见的 7 位 0x3C 必须左移一位。
   u8g2_SetI2CAddress(&oled, kOledAddress << 1);  // 把 7 位地址左移 1 位变成 8 位地址传给库。
   u8g2_InitDisplay(&oled);  // 向屏幕发送初始化命令序列。
   u8g2_SetPowerSave(&oled, 0);  // 关闭省电模式，让屏幕正常显示。
+  oledReady = true;
+}
+
+String oledI2cDevicesJson() {
+  String result = "[";
+  const uint16_t originalTimeout = Wire.getTimeOut();
+  Wire.setTimeOut(20);
+  bool first = true;
+  for (uint8_t address = 0x08; address < 0x78; ++address) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() != 0) continue;
+    if (!first) result += ',';
+    char text[40];
+    const char* module = address == kOledAddress ? "SSD1306 OLED" : "未知模块";
+    snprintf(text, sizeof(text), "\"0x%02X (%s)\"", address, module);
+    result += text;
+    first = false;
+  }
+  Wire.setTimeOut(originalTimeout);
+  result += ']';
+  return result;
 }
 
 void drawBootScreen() {  // 绘制开机启动画面。
+  if (!oledReady) return;
   // 所有画面均遵循 ClearBuffer -> Draw -> SendBuffer，避免残影。
   u8g2_ClearBuffer(&oled);  // 先清空缓冲区。
   u8g2_SetFont(&oled, u8g2_font_wqy12_t_gb2312);  // 选用 12 像素高的中文字体。
@@ -55,6 +148,7 @@ void drawBootScreen() {  // 绘制开机启动画面。
 }
 
 void drawProvisioningScreen(const char* ssid, const char* qrPayload) {  // 绘制配网页面（含二维码）。
+  if (!oledReady) return;
   u8g2_ClearBuffer(&oled);  // 清空缓冲区。
   // 二维码回调直接写入同一个帧缓冲；生成失败时仍会显示文字配网说明。
   esp_qrcode_config_t config = ESP_QRCODE_CONFIG_DEFAULT();  // 取二维码默认配置作为基础。
@@ -75,6 +169,7 @@ void drawProvisioningScreen(const char* ssid, const char* qrPayload) {  // 绘�
 }
 
 void drawNetworkConnectingScreen(const char* ssid) {  // 绘制“正在连接 WiFi”提示页。
+  if (!oledReady) return;
   u8g2_ClearBuffer(&oled);  // 清空缓冲区。
   u8g2_SetFont(&oled, u8g2_font_wqy12_t_gb2312);  // 中文字体。
   u8g2_DrawUTF8(&oled, 8, 25, "正在连接 WiFi");  // 显示连接中提示。
@@ -85,6 +180,7 @@ void drawNetworkConnectingScreen(const char* ssid) {  // 绘制“正在连接 W
 }
 
 void drawMonitor(const SensorData& data, const EnvironmentStatus& status) {  // 绘制实时监测主页面。
+  if (!oledReady) return;
   char line[32];  // 临时字符串缓冲，用来拼接每行文字。
   // 屏幕高度只有 64 像素：14 像素标题 + 4 行 12 像素正好容纳所有数据。
   u8g2_ClearBuffer(&oled);  // 清空缓冲区。
@@ -127,6 +223,7 @@ void drawMonitor(const SensorData& data, const EnvironmentStatus& status) {  // 
 void drawSettings(const Thresholds& thresholds, uint8_t selectedIndex, bool editing,  // 绘制设置页面。
                   const char* ipAddress, bool stationConnected,  // 传入 IP 与联网状态用于网络信息页。
                   const ReportUploadStatus& reportStatus, bool showNetworkInfo) {  // 传入上报状态与是否显示网络页。
+  if (!oledReady) return;
   // 这里使用局部快照数组，仅用于把结构体按固定菜单顺序渲染；修改操作
   // 仍由 main.cpp 统一完成，避免显示层拥有业务状态。
   const char* labels[] = {"室外阈值", "室内目标", "空气", "温度", "湿度"};  // 各设置项的中文名。

@@ -16,6 +16,9 @@ bool toneStarted = false;         // 是否已经调用过 tone()（避免启动
 bool enabled = true;              // 报警功能总开关，默认开
 uint8_t previousAlertMask = 0;    // 上一次的告警位（用来检测“新出现”的告警）
 uint32_t beepStartedMs = 0;       // 本次鸣叫开始的时间戳（毫秒）
+uint8_t queuedAlarmBeeps = 0;
+bool alarmPause = false;
+uint32_t alarmNextMs = 0;
 
 // 内部函数：打开或关闭蜂鸣器
 void setBuzzer(bool on) {
@@ -60,6 +63,19 @@ void buzzerInit() {
 // 每轮主循环调用：根据告警位决定是否鸣叫；activeAlertMask 每个 bit 代表一类告警
 void buzzerUpdate(uint8_t activeAlertMask) {
   const uint32_t now = millis();       // 取当前运行毫秒数
+  if (enabled && queuedAlarmBeeps != 0) {
+    if (buzzerOn && now - beepStartedMs >= kBuzzerOnMs) {
+      setBuzzer(false);
+      alarmPause = true;
+      alarmNextMs = now + 90;
+    } else if (!buzzerOn && alarmPause && static_cast<int32_t>(now - alarmNextMs) >= 0) {
+      alarmPause = false;
+      if (--queuedAlarmBeeps != 0) {
+        beepStartedMs = now;
+        setBuzzer(true);
+      }
+    }
+  }
   // 找出“这次有、上次没有”的告警位：activeAlertMask 与 (上次取反) 做按位与
   const uint8_t newlyActiveAlerts =
       activeAlertMask & static_cast<uint8_t>(~previousAlertMask);
@@ -83,6 +99,15 @@ void buzzerUpdate(uint8_t activeAlertMask) {
   }
 }
 
+void buzzerAlarmTwoBeep() {
+  if (!enabled) return;
+  queuedAlarmBeeps = 2;
+  alarmPause = false;
+  beepStartedMs = millis();
+  setBuzzer(true);
+  Serial.println("[BUZZER] I2C timeout alarm: two beeps");
+}
+
 // 对外查询：报警功能当前是否启用
 bool buzzerEnabled() { return enabled; }
 
@@ -103,7 +128,11 @@ bool buzzerSetEnabled(bool nextEnabled) {
   }
 
   enabled = nextEnabled;                     // 写入成功，更新内存里的状态
-  if (!enabled) setBuzzer(false);            // 如果是关闭，立即停止当前鸣叫
+  if (!enabled) {
+    queuedAlarmBeeps = 0;
+    alarmPause = false;
+    setBuzzer(false);                        // 如果是关闭，立即停止当前鸣叫
+  }
   Serial.printf("[BUZZER] enabled=%u saved to NVS\r\n", enabled ? 1 : 0);  // 打印保存结果
   return true;                               // 返回成功
 }

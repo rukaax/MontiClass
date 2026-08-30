@@ -37,6 +37,8 @@ class NetworkPortal {
   void sendStatus();
   void sendLightingConfig();
   void receiveLightingConfig();
+  void sendThresholds();
+  void receiveThresholds();
   void sendTime();
   void receiveTime();
   void sendNetworks();

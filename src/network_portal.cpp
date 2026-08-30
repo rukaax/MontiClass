@@ -196,53 +196,6 @@ const char kWebPage[] PROGMEM = R"HTML(
       </div>
     </section>
     <section class="card">
-      <h2>自动照明与无人关闭</h2>
-      <div class="grid">
-        <div>室内光照 1<div id="lightingLight1" class="value">--</div></div>
-        <div>室外光照 2<div id="lightingLight2" class="value">--</div></div>
-      </div>
-      <form id="lightingConfigForm" onsubmit="saveLightingConfig(event)">
-        <label>室外开灯阈值（光敏 2）
-          <input id="outdoorLightThreshold" type="range" min="0" max="100" step="1" />
-          <output id="outdoorLightThresholdValue">--%</output>
-        </label>
-        <label>室内目标光照（光敏 1）
-          <input id="lightHold" type="range" min="0" max="100" step="1" />
-          <output id="lightHoldValue">--%</output>
-        </label>
-        <div class="grid">
-          <label>自动调光开始<input id="lightingStart" type="time" step="60" required /></label>
-          <label>自动调光结束<input id="lightingEnd" type="time" step="60" required /></label>
-        </div>
-        <div class="grid">
-          <label>无人关灯延时（秒）<input id="lightingNoPresenceTimeout" type="number" min="1" max="86400" step="1" required /></label>
-          <label>无人关风扇延时（秒）<input id="fanNoPresenceTimeout" type="number" min="1" max="86400" step="1" required /></label>
-        </div>
-        <button type="submit">保存自动控制设置</button>
-      </form>
-      <p id="lightingConfigStatus" class="muted">读取中…</p>
-    </section>
-    <section class="card">
-      <h2>Wi-Fi 配网</h2>
-      <p class="muted">
-        扫描后从下拉框选择附近网络；隐藏网络可选“手动输入”。保存后设备将关闭配网热点并尝试连接。
-      </p>
-      <button id="scanButton" type="button" onclick="networks(true)">扫描附近 Wi-Fi</button>
-      <p id="scanStatus" class="muted">尚未扫描</p>
-      <form method="post" action="/api/wifi">
-        <label
-          >Wi-Fi 名称（SSID）<select id="ssidSelect" name="ssid" onchange="chooseSsid()">
-            <option value="">请先扫描并选择</option>
-            <option value="__manual__">手动输入隐藏网络…</option></select
-          ><input id="ssidManual" maxlength="32" placeholder="输入隐藏网络名称" hidden /></label
-        ><label>密码（开放网络可留空）<input name="password" type="password" maxlength="63" /></label
-        ><button type="submit">保存并连接</button>
-      </form>
-      <form method="post" action="/api/wifi/reset" onsubmit="return confirm('清除已保存的 Wi-Fi？')">
-        <button type="submit">清除 Wi-Fi，重新配网</button>
-      </form>
-    </section>
-    <section class="card">
       <h2>数据上报</h2>
       <p class="muted">设备 ID：<span id="reportDeviceId">--</span></p>
       <form id="reportingForm" onsubmit="saveReporting(event)">
@@ -294,8 +247,6 @@ const char kWebPage[] PROGMEM = R"HTML(
     <script>
       const unit = { light: "%", light2: "%", air: " AQI", temperature: " °C", humidity: "%" };
       const reportingForm = document.getElementById("reportingForm");
-      const lightingConfigForm = document.getElementById("lightingConfigForm");
-      let lightingConfigDirty = false;
       const dirtyReportFields = new Set();
       let reportFormLoaded = false,
         reportSaving = false;
@@ -308,81 +259,6 @@ const char kWebPage[] PROGMEM = R"HTML(
       function val(v, k) {
         return v === null ? "--" : v + unit[k];
       }
-      function renderLightingConfig(s, force = false) {
-        if (force || !lightingConfigDirty) {
-          document.getElementById("outdoorLightThreshold").value = s.threshold;
-          document.getElementById("lightHold").value = s.hold;
-          document.getElementById("lightingStart").value = s.start;
-          document.getElementById("lightingEnd").value = s.end;
-          document.getElementById("lightingNoPresenceTimeout").value = s.lightingTimeout;
-          document.getElementById("fanNoPresenceTimeout").value = s.fanTimeout;
-        }
-        document.getElementById("lightingLight1").textContent = s.light1 + "%";
-        document.getElementById("lightingLight2").textContent = s.light2 + "%";
-        document.getElementById("outdoorLightThresholdValue").textContent =
-          document.getElementById("outdoorLightThreshold").value + "%";
-        document.getElementById("lightHoldValue").textContent =
-          document.getElementById("lightHold").value + "%";
-        if (!lightingConfigDirty) {
-          document.getElementById("lightingConfigStatus").textContent = !s.automatic
-            ? "手动照明模式"
-            : !s.rtcValid
-              ? "RTC 时间无效，自动照明已关闭"
-              : s.scheduleActive
-                ? !s.presenceRecent
-                  ? "连续 " + s.lightingTimeout + " 秒无人，照明已关闭"
-                  : s.outdoorDark
-                    ? "室外低于阈值，正在调节室内光照"
-                    : "室外未低于阈值，照明已关闭"
-                : "自动调光时段外，照明已关闭";
-        }
-      }
-      async function refreshLightingConfig(force = false) {
-        try {
-          const r = await fetch("/api/lighting-config", { cache: "no-store" });
-          if (!r.ok) throw new Error(r.status);
-          renderLightingConfig(await r.json(), force);
-        } catch (e) {
-          document.getElementById("lightingConfigStatus").textContent = "读取照明设置失败";
-        }
-      }
-      async function saveLightingConfig(e) {
-        e.preventDefault();
-        const status = document.getElementById("lightingConfigStatus");
-        try {
-          status.textContent = "正在保存…";
-          const r = await fetch("/api/lighting-config", {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: new URLSearchParams({
-              threshold: document.getElementById("outdoorLightThreshold").value,
-              hold: document.getElementById("lightHold").value,
-              start: document.getElementById("lightingStart").value,
-              end: document.getElementById("lightingEnd").value,
-              lighting_timeout: document.getElementById("lightingNoPresenceTimeout").value,
-              fan_timeout: document.getElementById("fanNoPresenceTimeout").value,
-            }),
-          });
-          const j = await r.json();
-          if (!r.ok || !j.ok) throw new Error(j.message || r.status);
-          lightingConfigDirty = false;
-          status.textContent = j.message || "自动控制设置已保存";
-          await refreshLightingConfig(true);
-        } catch (e) {
-          status.textContent = "保存失败：" + (e.message || "请求错误");
-        }
-      }
-      ["outdoorLightThreshold", "lightHold", "lightingStart", "lightingEnd", "lightingNoPresenceTimeout", "fanNoPresenceTimeout"].forEach((id) => {
-        document.getElementById(id).addEventListener("input", () => {
-          lightingConfigDirty = true;
-        });
-      });
-      document.getElementById("lightHold").addEventListener("input", (e) => {
-        document.getElementById("lightHoldValue").textContent = e.target.value + "%";
-      });
-      document.getElementById("outdoorLightThreshold").addEventListener("input", (e) => {
-        document.getElementById("outdoorLightThresholdValue").textContent = e.target.value + "%";
-      });
       async function refresh() {
         try {
           let s = await (await fetch("/api/status", { cache: "no-store" })).json();
@@ -396,47 +272,8 @@ const char kWebPage[] PROGMEM = R"HTML(
             : s.connected
               ? "设备 IP：" + s.ip
               : "设备 IP：未连接";
-          refreshLightingConfig();
         } catch (e) {
           document.getElementById("network").textContent = "读取设备状态失败";
-        }
-      }
-      function chooseSsid() {
-        let s = document.getElementById("ssidSelect"),
-          m = document.getElementById("ssidManual"),
-          manual = s.value === "__manual__";
-        m.hidden = !manual;
-        m.name = manual ? "ssid" : "";
-        s.name = manual ? "" : "ssid";
-        m.required = manual;
-      }
-      async function networks(start = false) {
-        let b = document.getElementById("scanButton"),
-          t = document.getElementById("scanStatus"),
-          s = document.getElementById("ssidSelect");
-        try {
-          b.disabled = true;
-          b.textContent = "正在扫描…";
-          t.textContent = "正在扫描附近 Wi-Fi，请稍候…";
-          let n = await (
-            await fetch("/api/networks" + (start ? "?start=1" : ""), { cache: "no-store" })
-          ).json();
-          if (n.scanning) {
-            setTimeout(() => networks(false), 800);
-            return;
-          }
-          if (n.error) throw new Error(n.error);
-          s.replaceChildren(new Option("请选择 Wi-Fi", ""), new Option("手动输入隐藏网络…", "__manual__"));
-          n.networks.forEach((name) => s.add(new Option(name, name)));
-          t.textContent = n.networks.length
-            ? "扫描完成，找到 " + n.networks.length + " 个网络。"
-            : "扫描完成，未找到网络。";
-          b.disabled = false;
-          b.textContent = "重新扫描";
-        } catch (e) {
-          t.textContent = "扫描失败，请重试。";
-          b.disabled = false;
-          b.textContent = "扫描附近 Wi-Fi";
         }
       }
       function reportingStatus(r) {
@@ -570,6 +407,29 @@ const char kWebPage[] PROGMEM = R"HTML(
     </script>
   </body>
 </html>
+)HTML";
+
+const char kThresholdPage[] PROGMEM = R"HTML(
+<!doctype html><html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><title>阈值修改</title>
+<style>body{max-width:760px;margin:24px auto;padding:0 16px;font:16px system-ui;color:#172033;background:#f5f7fb}.card{background:#fff;border-radius:10px;padding:20px;box-shadow:0 2px 10px #0001}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}label{display:block;font-weight:600;margin:10px 0}input{width:100%;box-sizing:border-box;margin-top:7px}input[type=range]{accent-color:#2563eb}output{float:right;font-variant-numeric:tabular-nums;color:#2563eb}.actions{margin-top:18px}button{width:100%;padding:11px;border:0;border-radius:7px;background:#2563eb;color:#fff;font-weight:700}.muted{color:#596579;font-size:.9rem}@media(max-width:600px){.grid{grid-template-columns:1fr}}</style>
+<body><section class="card"><h1>系统阈值修改</h1><p class="muted">拖动滑块调整阈值，保存后立即生效。</p><form id="f">
+<div class="grid"><label>室外开灯阈值（光照 2）<input id="outdoor" name="outdoor" type="range" min="0" max="100" step="1"><output id="outdoorV"></output></label>
+<label>室内目标光照（光照 1）<input id="hold" name="hold" type="range" min="0" max="100" step="1"><output id="holdV"></output></label>
+<label>空气 AQI 阈值<input id="aqi" name="aqi" type="range" min="0" max="500" step="1"><output id="aqiV"></output></label>
+<label>温度阈值（°C）<input id="temperature" name="temperature" type="range" min="0" max="60" step="0.1"><output id="temperatureV"></output></label>
+<label>湿度阈值（%）<input id="humidity" name="humidity" type="range" min="0" max="100" step="1"><output id="humidityV"></output></label>
+<label>无人关风扇延时（秒）<input id="fanTimeout" name="fan_timeout" type="range" min="1" max="86400" step="1"><output id="fanTimeoutV"></output></label>
+<label>无人关灯延时（秒）<input id="lightingTimeout" name="lighting_timeout" type="range" min="1" max="86400" step="1"><output id="lightingTimeoutV"></output></label>
+</div><div class="grid"><label>自动调光开始<input id="start" name="start" type="time" step="60" required></label><label>自动调光结束<input id="end" name="end" type="time" step="60" required></label></div>
+<div class="actions"><button type="submit">保存全部阈值</button></div></form><p id="status" class="muted">读取中…</p></section>
+<script>const ids=['outdoor','hold','aqi','temperature','humidity','fanTimeout','lightingTimeout'];const units={outdoor:'%',hold:'%',aqi:' AQI',temperature:' °C',humidity:'%',fanTimeout:' 秒',lightingTimeout:' 秒'};const $=id=>document.getElementById(id);function render(){ids.forEach(id=>$(id+'V').textContent=$(id).value+units[id]);}ids.forEach(id=>$(id).addEventListener('input',render));async function load(){try{let r=await (await fetch('/api/thresholds',{cache:'no-store'})).json();$('outdoor').value=r.outdoor;$('hold').value=r.hold;$('aqi').value=r.aqi;$('temperature').value=r.temperature;$('humidity').value=r.humidity;$('fanTimeout').value=r.fanTimeout;$('lightingTimeout').value=r.lightingTimeout;$('start').value=r.start;$('end').value=r.end;render();}catch(e){$('status').textContent='读取阈值失败';}}$('f').onsubmit=async e=>{e.preventDefault();$('status').textContent='正在保存…';try{let r=await fetch('/api/thresholds',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(e.target))}),j=await r.json();if(!r.ok||!j.ok)throw Error(j.message||r.status);$('status').textContent=j.message||'阈值已保存';}catch(e){$('status').textContent='保存失败：'+e.message;}};load();</script></body></html>
+)HTML";
+
+const char kNetworkPage[] PROGMEM = R"HTML(
+<!doctype html><html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><title>网络连接</title>
+<style>body{max-width:620px;margin:24px auto;padding:0 16px;font:16px system-ui;color:#172033;background:#f5f7fb}.card{background:#fff;border-radius:10px;padding:20px;box-shadow:0 2px 10px #0001}label,input,select,button{display:block;width:100%;box-sizing:border-box;margin:10px 0;padding:10px;border-radius:7px;border:1px solid #ccd3df}button{background:#2563eb;color:#fff;border:0;font-weight:700}.muted{color:#596579;font-size:.9rem}</style>
+<body><section class="card"><h1>网络连接</h1><p class="muted">扫描附近 Wi‑Fi，选择热点后连接设备。</p><button id="scan" type="button">扫描附近热点</button><p id="scanStatus" class="muted">尚未扫描</p><form method="post" action="/api/wifi"><label>Wi‑Fi 热点<select id="ssidSelect" name="ssid" required><option value="">请先扫描</option><option value="__manual__">手动输入隐藏网络…</option></select></label><input id="ssidManual" maxlength="32" placeholder="输入隐藏网络名称" hidden><label>密码（开放网络可留空）<input name="password" type="password" maxlength="63"></label><button type="submit">连接此热点</button></form><form method="post" action="/api/wifi/reset"><button type="submit">清除已保存网络</button></form></section>
+<script>const $=id=>document.getElementById(id);function choose(){let m=$('ssidSelect').value==='__manual__';$('ssidManual').hidden=!m;$('ssidManual').name=m?'ssid':'';$('ssidSelect').name=m?'':'ssid';$('ssidManual').required=m;}$('ssidSelect').onchange=choose;async function scan(start=true){let b=$('scan'),t=$('scanStatus'),s=$('ssidSelect');b.disabled=true;t.textContent='正在扫描附近 Wi‑Fi…';try{let n=await(await fetch('/api/networks'+(start?'?start=1':''),{cache:'no-store'})).json();if(n.scanning){setTimeout(()=>scan(false),800);return;}if(n.error)throw Error(n.error);s.replaceChildren(new Option('请选择 Wi‑Fi',''),new Option('手动输入隐藏网络…','__manual__'));n.networks.forEach(x=>s.add(new Option(x,x)));t.textContent='找到 '+n.networks.length+' 个热点';}catch(e){t.textContent='扫描失败，请重试';}b.disabled=false;b.textContent='重新扫描';}$('scan').onclick=()=>scan(true);</script></body></html>
 )HTML";
 
 
@@ -840,7 +700,7 @@ const char kHomeTimeWidgetV2[] PROGMEM = R"HTML(
 
 const char kPageNav[] PROGMEM = R"HTML(
 <nav class="page-nav" aria-label="页面导航">
-  <a href="/">监测首页</a><a href="/time">时间校准</a><a href="/actuators">执行器调试</a><a href="/system">系统信息</a>
+  <a href="/">监测首页</a><a href="/thresholds">阈值修改</a><a href="/network">网络连接</a><a href="/actuators">执行器调试</a><a href="/system">系统信息</a>
 </nav>
 <style>.page-nav{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px;margin:0 0 4px}.page-nav a{display:inline-block;padding:9px 13px;border-radius:7px;background:#2563eb;color:#fff;text-decoration:none;font-weight:700}.page-nav a:hover{background:#1d4ed8}</style>
 )HTML";
@@ -850,7 +710,7 @@ const char kSystemPage[] PROGMEM = R"HTML(
 <title>系统信息</title><style>
 body{max-width:1000px;margin:24px auto;padding:0 16px;font:16px system-ui;color:#172033;background:#f5f7fb}
 .card{background:#fff;border-radius:10px;padding:18px;margin-top:14px;box-shadow:0 2px 10px #0001}.page-nav{display:flex;flex-wrap:wrap;gap:8px}.page-nav a{padding:9px 13px;border-radius:7px;background:#2563eb;color:#fff;text-decoration:none;font-weight:700}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}.item{padding:12px;border:1px solid #dbe2ed;border-radius:8px;background:#f8fafc}.muted{color:#596579;font-size:.9rem}strong{display:block;margin-top:4px;font-size:1.12rem;word-break:break-word}button{padding:10px 14px;border:0;border-radius:7px;background:#2563eb;color:#fff;font-weight:700}@media(max-width:600px){body{margin:14px auto}}
-</style><body><nav class="page-nav" aria-label="页面导航"><a href="/">监测首页</a><a href="/time">时间校准</a><a href="/actuators">执行器调试</a><a href="/system">系统信息</a></nav>
+</style><body><nav class="page-nav" aria-label="页面导航"><a href="/">监测首页</a><a href="/thresholds">阈值修改</a><a href="/network">网络连接</a><a href="/actuators">执行器调试</a><a href="/system">系统信息</a></nav>
 <section class="card"><h1>系统信息</h1><p id="status" class="muted">读取中…</p><div class="grid">
 <div class="item">CPU 型号<strong id="chip">--</strong></div><div class="item">CPU 频率<strong id="cpu">--</strong></div><div class="item">CPU ID<strong id="id">--</strong></div>
 <div class="item">Flash 总容量<strong id="flash">--</strong></div><div class="item">程序 Flash 占用<strong id="appflash">--</strong></div><div class="item">堆内存<strong id="heap">--</strong></div>
@@ -1429,16 +1289,24 @@ void NetworkPortal::configureRoutes() {
   reportUploader_.configureRoutes(server_);
   server_.on("/", HTTP_GET, [this]() {
     String page(kWebPage);
-    page.replace("</body>", String(kPageNav) + String(kWebUiFixes) + "</body>");
+    page.replace("</body>", String(kHomeTimeWidgetV2) + String(kPageNav) + String(kWebUiFixes) + "</body>");
     server_.sendHeader("Cache-Control", "no-store");
     server_.send(200, "text/html; charset=utf-8", page);
   });
   server_.on("/api/status", HTTP_GET, [this]() { sendStatus(); });
   server_.on("/api/lighting-config", HTTP_GET, [this]() { sendLightingConfig(); });
   server_.on("/api/lighting-config", HTTP_POST, [this]() { receiveLightingConfig(); });
-  server_.on("/time", HTTP_GET, [this]() {
+  server_.on("/api/thresholds", HTTP_GET, [this]() { sendThresholds(); });
+  server_.on("/api/thresholds", HTTP_POST, [this]() { receiveThresholds(); });
+  server_.on("/thresholds", HTTP_GET, [this]() {
     server_.sendHeader("Cache-Control", "no-store");
-    String page(kTimePageV2);
+    String page(kThresholdPage);
+    page.replace("<body>", String("<body>") + String(kPageNav));
+    server_.send(200, "text/html; charset=utf-8", page);
+  });
+  server_.on("/network", HTTP_GET, [this]() {
+    server_.sendHeader("Cache-Control", "no-store");
+    String page(kNetworkPage);
     page.replace("<body>", String("<body>") + String(kPageNav));
     server_.send(200, "text/html; charset=utf-8", page);
   });
@@ -1792,6 +1660,71 @@ void NetworkPortal::receiveLightingConfig() {
   }
   *thresholds_ = next;
   server_.send(200, "application/json", "{\"ok\":true,\"message\":\"自动控制设置已保存\"}");
+}
+
+void NetworkPortal::sendThresholds() {
+  const Thresholds empty{};
+  const Thresholds& t = thresholds_ == nullptr ? empty : *thresholds_;
+  char start[6], end[6];
+  formatTimeOfDay(t.lightingStartMinute, start, sizeof(start));
+  formatTimeOfDay(t.lightingEndMinute, end, sizeof(end));
+  char response[320];
+  snprintf(response, sizeof(response),
+           "{\"outdoor\":%.0f,\"hold\":%.0f,\"aqi\":%.0f,\"temperature\":%.1f,\"humidity\":%.0f,\"fanTimeout\":%u,\"lightingTimeout\":%u,\"start\":\"%s\",\"end\":\"%s\"}",
+           t.outdoorLightThresholdPercent, t.lightHoldPercent, t.mq135Aqi,
+           t.temperatureC, t.humidityPercent,
+           static_cast<unsigned>(t.fanNoPresenceTimeoutSeconds),
+           static_cast<unsigned>(t.lightingNoPresenceTimeoutSeconds), start, end);
+  server_.sendHeader("Cache-Control", "no-store");
+  server_.send(200, "application/json", response);
+}
+
+void NetworkPortal::receiveThresholds() {
+  if (thresholds_ == nullptr) {
+    server_.send(503, "application/json", "{\"ok\":false,\"message\":\"阈值尚未就绪\"}");
+    return;
+  }
+  const char* required[] = {"outdoor", "hold", "aqi", "temperature", "humidity",
+                            "fan_timeout", "lighting_timeout", "start", "end"};
+  for (const char* key : required) {
+    if (!server_.hasArg(key)) {
+      server_.send(400, "application/json", "{\"ok\":false,\"message\":\"阈值参数不完整\"}");
+      return;
+    }
+  }
+  const float outdoor = server_.arg("outdoor").toFloat();
+  const float hold = server_.arg("hold").toFloat();
+  const float aqi = server_.arg("aqi").toFloat();
+  const float temperature = server_.arg("temperature").toFloat();
+  const float humidity = server_.arg("humidity").toFloat();
+  const long fanTimeout = server_.arg("fan_timeout").toInt();
+  const long lightingTimeout = server_.arg("lighting_timeout").toInt();
+  uint16_t start = 0, end = 0;
+  if (!isfinite(outdoor) || !isfinite(hold) || !isfinite(aqi) || !isfinite(temperature) ||
+      !isfinite(humidity) || outdoor < 0 || outdoor > 100 || hold < 0 || hold > 100 ||
+      aqi < 0 || aqi > 500 || temperature < 0 || temperature > 60 || humidity < 0 ||
+      humidity > 100 || fanTimeout < 1 || fanTimeout > 86400 || lightingTimeout < 1 ||
+      lightingTimeout > 86400 || !parseTimeOfDay(server_.arg("start"), start) ||
+      !parseTimeOfDay(server_.arg("end"), end)) {
+    server_.send(400, "application/json", "{\"ok\":false,\"message\":\"阈值超出允许范围\"}");
+    return;
+  }
+  Thresholds next = *thresholds_;
+  next.outdoorLightThresholdPercent = outdoor;
+  next.lightHoldPercent = hold;
+  next.mq135Aqi = aqi;
+  next.temperatureC = temperature;
+  next.humidityPercent = humidity;
+  next.fanNoPresenceTimeoutSeconds = static_cast<uint32_t>(fanTimeout);
+  next.lightingNoPresenceTimeoutSeconds = static_cast<uint32_t>(lightingTimeout);
+  next.lightingStartMinute = start;
+  next.lightingEndMinute = end;
+  if (!thresholdStoreSave(next)) {
+    server_.send(500, "application/json", "{\"ok\":false,\"message\":\"阈值保存失败\"}");
+    return;
+  }
+  *thresholds_ = next;
+  server_.send(200, "application/json", "{\"ok\":true,\"message\":\"全部阈值已保存\"}");
 }
 
 // GET /api/time - 返回 RTC 当前时间、NTP 服务器和同步状态。

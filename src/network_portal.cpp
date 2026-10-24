@@ -1294,6 +1294,15 @@ void NetworkPortal::configureRoutes() {
     server_.send(200, "text/html; charset=utf-8", page);
   });
   server_.on("/api/status", HTTP_GET, [this]() { sendStatus(); });
+  server_.on("/tls/ca.crt", HTTP_GET, [this]() {
+    const String& certificate = localHttps_.caCertificatePem();
+    if (certificate.isEmpty()) {
+      server_.send(503, "text/plain; charset=utf-8", "Local CA is not available");
+      return;
+    }
+    server_.sendHeader("Content-Disposition", "attachment; filename=classroom-esp32-local-ca.crt");
+    server_.send(200, "application/x-x509-ca-cert", certificate);
+  });
   server_.on("/api/lighting-config", HTTP_GET, [this]() { sendLightingConfig(); });
   server_.on("/api/lighting-config", HTTP_POST, [this]() { receiveLightingConfig(); });
   server_.on("/api/thresholds", HTTP_GET, [this]() { sendThresholds(); });
@@ -1529,6 +1538,7 @@ void NetworkPortal::startStation(const String& ssid, const String& password) {
 // 上电初始化：注册路由、加载凭据，能连就连、连不上就开配网热点。
 void NetworkPortal::begin() {
   reportUploader_.begin();
+  localHttps_.begin();
   configureRoutes();
   // persistent() 不写入 Arduino Wi-Fi 默认存储，凭据只由本模块的 NVS 管理。
   WiFi.persistent(false);
@@ -1568,6 +1578,9 @@ void NetworkPortal::sendStatus() {
                     ",\"rtcNow\":\"" + rtcNow + "\",\"rtcValid\":" +
                     String(rtcNow.isEmpty() ? "false" : "true") +
                     ",\"ntpServer\":\"" + escapeJson(rtcClock.ntpServer()) + "\"" +
+                    ",\"httpsReady\":" + (localHttps_.ready() ? "true" : "false") +
+                    ",\"httpsUrl\":\"" + localHttps_.httpsBaseUrl() + "\"" +
+                    ",\"localCaUrl\":\"/tls/ca.crt\"" +
                     ",\"apSsid\":\"" + apSsid_ + "\",\"ip\":\"" +
                     (provisioning_ ? WiFi.softAPIP().toString() :
                      (stationConnected ? WiFi.localIP().toString() : String())) + "\"}";
@@ -1983,6 +1996,7 @@ void NetworkPortal::update(const SensorData& latestData) {
       startProvisioning();
     }
   }
+  localHttps_.update(latestData, isStationConnected(), WiFi.localIP());
   rtcClock.updateNtp(WiFi.status() == WL_CONNECTED);
   reportUploader_.update(latestData);
 }

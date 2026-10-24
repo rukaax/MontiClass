@@ -352,6 +352,36 @@ curl http://192.168.1.88/api/status
 curl -X POST http://192.168.1.88/api/reporting/send
 ```
 
+### 从远程 HTTPS 页面访问局域网设备
+
+固件在 STA 成功联网并取得 DHCP 地址后，还会在 443 端口启动 HTTPS API。设备首次启动时生成一个长期保存在 NVS 的本地 CA；每次 IP 改变时，设备会用同一个 CA 重签一张包含当前 IP `subjectAltName` 的服务器证书，因此不必为每次 DHCP 地址变化重新安装 CA。
+
+1. 先在同一局域网打开 `http://设备IP/tls/ca.crt`，下载 `classroom-esp32-local-ca.crt`。
+2. 把该证书安装到需要访问设备的电脑/手机的“受信任根证书颁发机构”。只打开浏览器的“继续访问不安全页面”通常不足以让跨域 `fetch()` 通过。
+3. 重启浏览器后访问 `https://设备IP/api/status` 验证证书和连接。串口也会输出 `[TLS] HTTPS API ready: https://设备IP`。
+4. 远程网页使用 HTTPS 地址调用；首次从公网网页连接局域网设备时，Chrome 还可能弹出“本地网络访问”权限，用户必须允许。
+
+```js
+const esp32 = "https://192.168.1.88";
+
+const status = await fetch(`${esp32}/api/status`, {
+  cache: "no-store",
+  // 新版 Chromium 支持该提示；IP 字面量通常也能自动识别为 local。
+  targetAddressSpace: "local",
+}).then((response) => response.json());
+
+await fetch(`${esp32}/api/actuator`, {
+  method: "POST",
+  headers: { "Content-Type": "application/x-www-form-urlencoded" },
+  body: new URLSearchParams({ servo_angle: "120" }),
+  targetAddressSpace: "local",
+});
+```
+
+HTTPS 端目前提供 `GET /api/status`、`GET /api/actuator`、`POST /api/actuator`，并返回 CORS 与本地网络预检响应头。80 端口仍保留给首次配网、完整 WebUI 和 CA 下载。
+
+> 安全提示：这些本地控制接口目前没有登录或 API Token。启用跨域访问后，同一浏览器中获准访问本地网络的网页可能尝试调用设备；请只在可信局域网使用，并在对公网部署前增加设备级鉴权。
+
 完整参数及返回字段见 [src/network_portal.cpp](src/network_portal.cpp) 和 [src/report_uploader.cpp](src/report_uploader.cpp)。系统日志和上报回调日志均为内存记录，重启后清空。上报日志总容量为 12 条，优先保留错误，成功回调最多保留 5 条；成功 / 错误响应正文分别最多保留 64 / 256 字节。
 
 ## 项目结构

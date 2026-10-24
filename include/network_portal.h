@@ -7,6 +7,7 @@
 #include <WebServer.h>
 
 #include "report_uploader.h"
+#include "local_https.h"
 #include "rtc_clock.h"
 #include "sensors.h"
 #include "thresholds.h"
@@ -50,6 +51,7 @@ class NetworkPortal {
   void receiveCredentials();
 
   WebServer server_{80};
+  LocalHttpsApi localHttps_;
   DNSServer dnsServer_;
   ReportUploader reportUploader_;
   const SensorData* latestData_ = nullptr;

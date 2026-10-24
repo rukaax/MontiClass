@@ -50,25 +50,8 @@ cd MontiClass
 
 SSH 克隆需要先配置 GitHub SSH Key；也可以使用 HTTPS 地址 `https://github.com/rukaax/MontiClass.git`。
 
-### 先体验 WebUI
 
-准备 Python 3，在项目根目录执行：
-
-```bash
-python3 tools/network_portal_demo.py
-```
-
-浏览器打开 <http://127.0.0.1:8000/>。脚本默认监听 `0.0.0.0:8000`，同一局域网中的设备也可通过运行电脑的 IP 访问；终端会输出可用地址。按 `Ctrl+C` 停止。
-
-如需仅在本机访问或更换端口：
-
-```bash
-python3 tools/network_portal_demo.py --host 127.0.0.1 --port 8080
-```
-
-演示直接从 [src/network_portal.cpp](src/network_portal.cpp) 提取页面，无需安装第三方 Python 包。传感器数据、Wi-Fi 扫描、阈值、执行器、RTC、日志和上报回调均为模拟；配置仅保存在内存中，重启脚本后恢复演示初始值。演示初始值与硬件固件默认值可以不同。
-
-### 部署到 ESP32-S3
+### 部署到客户端
 
 安装 PlatformIO 并按[接线说明](#硬件与接线)连接硬件后，在项目根目录执行：
 
@@ -422,8 +405,6 @@ MontiClass/
 │   └── cert/
 │       ├── README.md           # 根证书包来源说明
 │       └── x509_crt_bundle.bin # 构建时嵌入的 HTTPS 根证书包
-├── tools/
-│   └── network_portal_demo.py  # 复用固件 WebUI 的 Python 模拟服务
 ├── lib/                        # PlatformIO 项目私有库目录，目前保留说明文件
 └── test/                       # PlatformIO 测试目录，目前保留说明文件
 ```

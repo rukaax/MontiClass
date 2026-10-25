@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: firmware-release
+  cancel-in-progress: false
+
 jobs:
   build-and-release:
     name: Build ESP32-S3 firmware and publish release
@@ -18,6 +22,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -42,9 +48,24 @@ jobs:
         run: |
           set -euo pipefail
 
-          short_sha="${GITHUB_SHA::7}"
           project_name="${GITHUB_REPOSITORY#*/}"
-          version="build-${GITHUB_RUN_NUMBER}-${short_sha}"
+          current_version="$(git tag --points-at "${GITHUB_SHA}" --list 'V*' --sort=-v:refname | awk '/^V[0-9]+\.[0-9]+\.[0-9]+$/ && !found { print; found=1 }')"
+          latest_version="$(git tag --list 'V*' --sort=-v:refname | awk '/^V[0-9]+\.[0-9]+\.[0-9]+$/ && !found { print; found=1 }')"
+
+          if [[ -n "${current_version}" ]]; then
+            version="${current_version}"
+          elif [[ -z "${latest_version}" ]]; then
+            version="V1.3.1"
+          elif [[ "${latest_version}" =~ ^V([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            major="${BASH_REMATCH[1]}"
+            minor="${BASH_REMATCH[2]}"
+            patch="${BASH_REMATCH[3]}"
+            version="V${major}.${minor}.$((patch + 1))"
+          else
+            echo "Unsupported release tag: ${latest_version}" >&2
+            exit 1
+          fi
+
           prefix="${project_name}-${version}"
           build_dir=".pio/build/esp32s3"
 
@@ -63,22 +84,14 @@ jobs:
           tar -C release/bundle -czf "release/assets/${prefix}.tar.gz" .
 
           {
-            echo "tag=firmware-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}-${short_sha}"
-            echo "title=Firmware ${version}"
+            echo "tag=${version}"
+            echo "title=${version}"
           } >> "${GITHUB_OUTPUT}"
 
       - name: Write release notes
         shell: bash
         run: |
-          cat > release-notes.md <<EOF
-          Automated firmware build for commit ${GITHUB_SHA}.
-
-          - Branch: ${GITHUB_REF_NAME}
-          - PlatformIO environment: esp32s3
-          - Workflow run: #${GITHUB_RUN_NUMBER} (attempt ${GITHUB_RUN_ATTEMPT})
-
-          Download the compressed archive for the complete firmware bundle, or download individual files as needed. Verify downloads with SHA256SUMS.txt.
-          EOF
+          git log -1 --pretty=%B > release-notes.md
 
       - name: Publish GitHub release
         env:
@@ -86,9 +99,20 @@ jobs:
           RELEASE_TAG: ${{ steps.package.outputs.tag }}
           RELEASE_TITLE: ${{ steps.package.outputs.title }}
         run: |
-          gh release create "${RELEASE_TAG}" release/assets/* \
-            --repo "${GITHUB_REPOSITORY}" \
-            --target "${GITHUB_SHA}" \
-            --title "${RELEASE_TITLE}" \
-            --notes-file release-notes.md \
-            --latest
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" release/assets/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --clobber
+            gh release edit "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${RELEASE_TITLE}" \
+              --notes-file release-notes.md \
+              --latest
+          else
+            gh release create "${RELEASE_TAG}" release/assets/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "${RELEASE_TITLE}" \
+              --notes-file release-notes.md \
+              --latest
+          fi

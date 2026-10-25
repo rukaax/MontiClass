@@ -19,13 +19,43 @@
 
 namespace {
 constexpr char kTlsNamespace[] = "local_tls";
+constexpr char kTlsSchemaKey[] = "schema";
 constexpr char kCaKeyKey[] = "ca_key";
 constexpr char kCaCertKey[] = "ca_cert";
-constexpr char kCaName[] = "CN=Classroom ESP32 Local CA,O=MontiClass";
-constexpr char kServerName[] = "CN=classroom-esp32.local,O=MontiClass";
+constexpr char kServerKeyKey[] = "server_key";
+constexpr char kServerCertKey[] = "server_cert";
+constexpr char kServerIpKey[] = "server_ip";
+constexpr uint8_t kTlsSchemaVersion = 2;
+constexpr char kCaName[] = "CN=Siconn-MontiClass,O=MontiClass";
+constexpr char kServerName[] = "CN=Siconn-MontiClass,O=MontiClass";
 constexpr char kNotBefore[] = "20240101000000";
 constexpr char kNotAfter[] = "20491231235959";
 constexpr uint32_t kStartRetryMs = 30000;
+
+uint32_t ipToUint32(const IPAddress& ip) {
+  return (static_cast<uint32_t>(ip[0]) << 24) |
+         (static_cast<uint32_t>(ip[1]) << 16) |
+         (static_cast<uint32_t>(ip[2]) << 8) | ip[3];
+}
+
+bool validServerIdentity(const String& privateKeyPem, const String& certificatePem) {
+  if (privateKeyPem.isEmpty() || certificatePem.isEmpty()) return false;
+  mbedtls_pk_context key;
+  mbedtls_x509_crt certificate;
+  mbedtls_pk_init(&key);
+  mbedtls_x509_crt_init(&certificate);
+  const bool valid =
+      mbedtls_pk_parse_key(&key,
+          reinterpret_cast<const unsigned char*>(privateKeyPem.c_str()),
+          privateKeyPem.length() + 1, nullptr, 0) == 0 &&
+      mbedtls_x509_crt_parse(&certificate,
+          reinterpret_cast<const unsigned char*>(certificatePem.c_str()),
+          certificatePem.length() + 1) == 0 &&
+      mbedtls_pk_check_pair(&certificate.pk, &key) == 0;
+  mbedtls_x509_crt_free(&certificate);
+  mbedtls_pk_free(&key);
+  return valid;
+}
 
 String jsonNumber(float value, uint8_t digits) {
   return isnan(value) ? "null" : String(value, static_cast<unsigned int>(digits));
@@ -318,7 +348,12 @@ bool LocalHttpsApi::begin() {
 
 bool LocalHttpsApi::loadOrCreateCa() {
   Preferences preferences;
-  if (preferences.begin(kTlsNamespace, true)) {
+  if (preferences.begin(kTlsNamespace, false)) {
+    if (preferences.getUChar(kTlsSchemaKey, 0) != kTlsSchemaVersion) {
+      preferences.clear();
+      preferences.putUChar(kTlsSchemaKey, kTlsSchemaVersion);
+      Serial.println("[TLS] certificate storage upgraded; local CA must be reinstalled");
+    }
     const size_t keyLength = preferences.getBytesLength(kCaKeyKey);
     const size_t certLength = preferences.getBytesLength(kCaCertKey);
     if (keyLength > 0 && certLength > 0) {
@@ -358,6 +393,7 @@ bool LocalHttpsApi::createCa() {
   if (ok) {
     Preferences preferences;
     ok = preferences.begin(kTlsNamespace, false) &&
+         preferences.putUChar(kTlsSchemaKey, kTlsSchemaVersion) == sizeof(uint8_t) &&
          preferences.putBytes(kCaKeyKey, caPrivateKeyPem_.c_str(), caPrivateKeyPem_.length()) == caPrivateKeyPem_.length() &&
          preferences.putBytes(kCaCertKey, caCertificatePem_.c_str(), caCertificatePem_.length()) == caCertificatePem_.length();
     preferences.end();
@@ -368,6 +404,54 @@ bool LocalHttpsApi::createCa() {
   mbedtls_entropy_free(&entropy);
   Serial.println(ok ? "[TLS] created persistent local CA" : "[TLS] ERROR: could not create local CA");
   return ok;
+}
+
+bool LocalHttpsApi::loadServerIdentity(const IPAddress& stationIp) {
+  Preferences preferences;
+  if (!preferences.begin(kTlsNamespace, true)) return false;
+  const uint32_t savedIp = preferences.getUInt(kServerIpKey, 0);
+  const size_t keyLength = preferences.getBytesLength(kServerKeyKey);
+  const size_t certLength = preferences.getBytesLength(kServerCertKey);
+  if (savedIp != ipToUint32(stationIp) || keyLength == 0 || certLength == 0) {
+    preferences.end();
+    return false;
+  }
+
+  char* key = new char[keyLength + 1];
+  char* cert = new char[certLength + 1];
+  const bool read = preferences.getBytes(kServerKeyKey, key, keyLength) == keyLength &&
+                    preferences.getBytes(kServerCertKey, cert, certLength) == certLength;
+  preferences.end();
+  key[keyLength] = 0;
+  cert[certLength] = 0;
+  if (read) {
+    serverPrivateKeyPem_ = key;
+    serverCertificatePem_ = cert;
+  }
+  delete[] key;
+  delete[] cert;
+  if (!read || !validServerIdentity(serverPrivateKeyPem_, serverCertificatePem_)) {
+    serverPrivateKeyPem_ = String();
+    serverCertificatePem_ = String();
+    return false;
+  }
+  certificateIp_ = stationIp;
+  Serial.printf("[TLS] reusing saved certificate for unchanged IP %s\r\n",
+                stationIp.toString().c_str());
+  return true;
+}
+
+bool LocalHttpsApi::saveServerIdentity(const IPAddress& stationIp) {
+  Preferences preferences;
+  const bool opened = preferences.begin(kTlsNamespace, false);
+  const bool saved = opened &&
+      preferences.putBytes(kServerKeyKey, serverPrivateKeyPem_.c_str(),
+                           serverPrivateKeyPem_.length()) == serverPrivateKeyPem_.length() &&
+      preferences.putBytes(kServerCertKey, serverCertificatePem_.c_str(),
+                           serverCertificatePem_.length()) == serverCertificatePem_.length() &&
+      preferences.putUInt(kServerIpKey, ipToUint32(stationIp)) == sizeof(uint32_t);
+  if (opened) preferences.end();
+  return saved;
 }
 
 bool LocalHttpsApi::createServerIdentity(const IPAddress& stationIp) {
@@ -383,9 +467,7 @@ bool LocalHttpsApi::createServerIdentity(const IPAddress& stationIp) {
       &caKey, reinterpret_cast<const unsigned char*>(caPrivateKeyPem_.c_str()),
       caPrivateKeyPem_.length() + 1, nullptr, 0) == 0;
   const bool serverReady = caReady && initEcKey(serverKey, random);
-  const uint32_t serial = (static_cast<uint32_t>(stationIp[0]) << 24) |
-                          (static_cast<uint32_t>(stationIp[1]) << 16) |
-                          (static_cast<uint32_t>(stationIp[2]) << 8) | stationIp[3];
+  const uint32_t serial = ipToUint32(stationIp);
   bool ok = serverReady &&
       setCommonCertificateFields(certificate, serverKey, caKey, kServerName, kCaName, serial) &&
       mbedtls_x509write_crt_set_basic_constraints(&certificate, 0, -1) == 0 &&
@@ -399,15 +481,33 @@ bool LocalHttpsApi::createServerIdentity(const IPAddress& stationIp) {
   mbedtls_pk_free(&caKey);
   mbedtls_ctr_drbg_free(&random);
   mbedtls_entropy_free(&entropy);
-  return ok;
+  if (!ok || !saveServerIdentity(stationIp)) {
+    serverPrivateKeyPem_ = String();
+    serverCertificatePem_ = String();
+    return false;
+  }
+  certificateIp_ = stationIp;
+  Serial.printf("[TLS] issued and saved certificate for new IP %s\r\n",
+                stationIp.toString().c_str());
+  return true;
+}
+
+bool LocalHttpsApi::loadOrCreateServerIdentity(const IPAddress& stationIp) {
+  if (certificateIp_ == stationIp &&
+      validServerIdentity(serverPrivateKeyPem_, serverCertificatePem_)) {
+    return true;
+  }
+  serverPrivateKeyPem_ = String();
+  serverCertificatePem_ = String();
+  return loadServerIdentity(stationIp) || createServerIdentity(stationIp);
 }
 
 bool LocalHttpsApi::start(const IPAddress& stationIp) {
   stop();
   lastStartAttemptMs_ = millis();
   if (caCertificatePem_.isEmpty() && !loadOrCreateCa()) return false;
-  if (!createServerIdentity(stationIp)) {
-    Serial.println("[TLS] ERROR: certificate generation failed");
+  if (!loadOrCreateServerIdentity(stationIp)) {
+    Serial.println("[TLS] ERROR: certificate load/generation failed");
     return false;
   }
   httpd_ssl_config_t config = HTTPD_SSL_CONFIG_DEFAULT();

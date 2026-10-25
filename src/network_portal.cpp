@@ -1300,7 +1300,7 @@ void NetworkPortal::configureRoutes() {
       server_.send(503, "text/plain; charset=utf-8", "Local CA is not available");
       return;
     }
-    server_.sendHeader("Content-Disposition", "attachment; filename=classroom-esp32-local-ca.crt");
+    server_.sendHeader("Content-Disposition", "attachment; filename=Siconn-MontiClass.crt");
     server_.send(200, "application/x-x509-ca-cert", certificate);
   });
   server_.on("/api/lighting-config", HTTP_GET, [this]() { sendLightingConfig(); });

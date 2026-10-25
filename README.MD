@@ -337,12 +337,42 @@ curl -X POST http://192.168.1.88/api/reporting/send
 
 ### 从远程 HTTPS 页面访问局域网设备
 
-固件在 STA 成功联网并取得 DHCP 地址后，还会在 443 端口启动 HTTPS API。设备首次启动时生成一个长期保存在 NVS 的本地 CA；每次 IP 改变时，设备会用同一个 CA 重签一张包含当前 IP `subjectAltName` 的服务器证书，因此不必为每次 DHCP 地址变化重新安装 CA。
+固件在 STA 成功联网并取得 DHCP 地址后，还会在 443 端口启动 HTTPS API。本地 CA 和服务器证书的 CN 均为 `Siconn-MontiClass`，服务器证书同时包含当前 IPv4 地址的 `subjectAltName`。
 
-1. 先在同一局域网打开 `http://设备IP/tls/ca.crt`，下载 `classroom-esp32-local-ca.crt`。
-2. 把该证书安装到需要访问设备的电脑/手机的“受信任根证书颁发机构”。只打开浏览器的“继续访问不安全页面”通常不足以让跨域 `fetch()` 通过。
-3. 重启浏览器后访问 `https://设备IP/api/status` 验证证书和连接。串口也会输出 `[TLS] HTTPS API ready: https://设备IP`。
-4. 远程网页使用 HTTPS 地址调用；首次从公网网页连接局域网设备时，Chrome 还可能弹出“本地网络访问”权限，用户必须允许。
+设备会把本地 CA、服务器私钥、服务器证书和签发时的 IPv4 地址保存在 NVS：
+
+- 本次启动取得的 IP 与 NVS 中记录的 IP 一致时，直接复用原服务器证书，不再次生成或签发。
+- 只有取得的 IP 与上次签发时不同，才使用同一个本地 CA 重新签发并保存服务器证书。
+- IP 改变只需要服务器证书重签；客户端已经安装的本地 CA 不需要重新安装。
+- 从旧版固件首次升级到当前证书存储格式时，会重新创建一次 CA，因此需要删除旧证书并重新安装新的 `Siconn-MontiClass.crt`。
+
+#### 客户端必须安装的证书
+
+需要安装的是设备提供的**本地根 CA** `Siconn-MontiClass.crt`，不是 HTTPS 服务器证书，也不需要安装任何私钥。只从自己确认过的 MontiClass 设备下载并信任该证书；把自签 CA 加入受信任根存储后，该 CA 签发的证书都会被本机信任。
+
+1. 让客户端与设备连接到同一局域网。
+2. 打开 `http://设备IP/tls/ca.crt`，下载 `Siconn-MontiClass.crt`。
+3. 按操作系统安装到受信任根证书存储：
+   - **Windows**：运行 `certlm.msc`，进入“受信任的根证书颁发机构” → “证书”，导入 `Siconn-MontiClass.crt`。此操作通常需要管理员权限。
+   - **macOS**：使用“钥匙串访问”导入到“系统”钥匙串，打开该证书，在“信任”中把 SSL / 使用此证书时设置为“始终信任”。
+   - **Ubuntu / Debian**：执行下面的命令，把证书加入系统 CA 存储。
+   - **Android**：设置 → 安全和隐私 → 更多安全设置 → 加密与凭据 → 安装证书，选择 CA / WLAN 证书并选中下载的文件；菜单名称可能随厂商不同。
+   - **iPhone / iPad**：打开证书并安装描述文件，然后到“设置” → “通用” → “关于本机” → “证书信任设置”，为 `Siconn-MontiClass` 启用完全信任。
+4. 完全退出并重新打开浏览器，再访问 `https://设备IP/api/status`。浏览器不应再显示证书不受信任错误。
+
+```bash
+sudo install -m 0644 Siconn-MontiClass.crt /usr/local/share/ca-certificates/Siconn-MontiClass.crt
+sudo update-ca-certificates
+```
+
+可用 OpenSSL 检查证书 CN，并直接验证 HTTPS：
+
+```bash
+openssl x509 -in Siconn-MontiClass.crt -noout -subject -issuer -fingerprint -sha256
+curl https://设备IP/api/status
+```
+
+只打开浏览器的“继续访问不安全页面”通常不足以让跨域 `fetch()` 通过。串口启动日志会显示是复用已有证书，还是因为 IP 变化而签发新证书。远程网页使用 HTTPS 地址调用；首次从公网网页连接局域网设备时，Chrome 还可能弹出“本地网络访问”权限，用户必须允许。
 
 ```js
 const esp32 = "https://192.168.1.88";

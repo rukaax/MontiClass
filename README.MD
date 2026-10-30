@@ -477,5 +477,3 @@ MontiClass/
 ## 许可证
 
 本项目采用 [CC BY-NC-SA 4.0](LICENSE)（知识共享署名—非商业性使用—相同方式共享 4.0 国际）许可。分享或改编时须遵守署名、非商业性使用和相同方式共享要求，完整条款见 [LICENSE](LICENSE) 和 [Creative Commons 官方说明](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh-hans)。
-
-© 2026 RukaaX Develop
